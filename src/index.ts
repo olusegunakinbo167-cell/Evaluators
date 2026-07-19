@@ -1,7 +1,15 @@
 // src/index.ts
 
 import app from "./api/server";
-import { evaluate, evaluateAuto } from "./components/evaluator";
+import {
+  evaluate,
+  evaluateAuto,
+  checkMinScore,
+  checkRegression,
+  loadBaseline,
+  formatThresholdFailures,
+  formatRegressionFailures,
+} from "./components/evaluator";
 import { exportResult, exportToJSON, exportToCSV, exportToMarkdown } from "./utils/exporter";
 import { EvaluationInput, Confidence } from "./types";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
@@ -9,6 +17,18 @@ import { getCacheStats } from "./components/llm/judge";
 
 const PORT = process.env.PORT || 3000;
 const AUTO_JUDGE = (process.env.AUTO_JUDGE ?? "true").toLowerCase() !== "false";
+
+function getArg(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx !== -1 ? args[idx + 1] : undefined;
+}
+
+function getArgFloat(args: string[], flag: string): number | undefined {
+  const v = getArg(args, flag);
+  if (v === undefined) return undefined;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 // ─── Demo: run a sample evaluation on startup ────────────────────────────────
 
@@ -121,7 +141,9 @@ async function runDemo() {
 }
 
 // CLI mode: node dist/index.js --eval <input.json>
-// or: node dist/index.js --eval <input.json> --export json|csv|md
+//   [--export json|csv|md]
+//   [--min-score <float>]
+//   [--baseline <path> --max-regression <float>]
 async function runCli() {
   const args = process.argv.slice(2);
   const evalIdx = args.indexOf("--eval");
@@ -129,7 +151,12 @@ async function runCli() {
 
   const inputPath = args[evalIdx + 1];
   if (!inputPath) {
-    console.error("Usage: node dist/index.js --eval <input.json> [--export json|csv|md]");
+    console.error(
+      "Usage: node dist/index.js --eval <input.json> " +
+      "[--export json|csv|md] " +
+      "[--min-score <float>] " +
+      "[--baseline <path> --max-regression <float>]"
+    );
     process.exit(1);
   }
 
@@ -150,12 +177,45 @@ async function runCli() {
     );
   }
 
-  const exportIdx = args.indexOf("--export");
-  if (exportIdx !== -1) {
-    const format = (args[exportIdx + 1] ?? "json") as "json" | "csv" | "md" | "markdown";
-    const filepath = exportResult(result, format);
+  // ─── Threshold / regression enforcement ──────────────────────────────
+  let failed = false;
+
+  const minScore = getArgFloat(args, "--min-score");
+  if (minScore !== undefined) {
+    const violations = checkMinScore(result, minScore);
+    if (violations.length > 0) {
+      console.error(formatThresholdFailures(violations));
+      failed = true;
+    }
+  }
+
+  const baselinePath = getArg(args, "--baseline");
+  if (baselinePath) {
+    const maxRegression = getArgFloat(args, "--max-regression") ?? 0;
+    try {
+      const baseline = loadBaseline(baselinePath);
+      const regressions = checkRegression(result, baseline, maxRegression);
+      if (regressions.length > 0) {
+        console.error(formatRegressionFailures(regressions));
+        failed = true;
+      }
+    } catch (err: any) {
+      console.error(`\n❌ Failed to load baseline from ${baselinePath}: ${err?.message ?? err}\n`);
+      process.exit(1);
+    }
+  }
+
+  // Export (always write output files, even on failure, for CI artifact upload)
+  const exportFormat = getArg(args, "--export") as "json" | "csv" | "md" | "markdown" | undefined;
+  if (exportFormat) {
+    const filepath = exportResult(result, exportFormat);
     console.log(`\n✅ Exported: ${filepath}`);
   }
+
+  if (failed) {
+    process.exit(1);
+  }
+
   return true;
 }
 

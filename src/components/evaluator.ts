@@ -1,5 +1,6 @@
 // src/components/evaluator.ts
 
+import * as fs from "fs";
 import {
   EvaluationInput,
   EvaluationResult,
@@ -144,6 +145,146 @@ export function validateRubricPayload(candidate: unknown): candidate is RubricSc
     if (typeof v !== "number" || v < dim.minScore || v > dim.maxScore) return false;
   }
   return true;
+}
+
+// ─── Threshold / regression enforcement ──────────────────────────────────────
+
+export interface ThresholdViolation {
+  responseId: string;
+  weightedScore: number;
+  minScore: number;
+  delta: number; // score - minScore (negative = violation)
+}
+
+export interface RegressionViolation {
+  responseId: string;
+  dimension: RubricDimensionKey | "weightedScore";
+  current: number;
+  baseline: number;
+  delta: number; // current - baseline (negative = regression)
+  allowedRegression: number;
+}
+
+/**
+ * Check if any ranked response falls below the minimum weighted score threshold.
+ * Returns a list of violations (empty = pass).
+ */
+export function checkMinScore(
+  result: EvaluationResult,
+  minScore: number
+): ThresholdViolation[] {
+  const violations: ThresholdViolation[] = [];
+  for (const r of result.rankings) {
+    if (r.weightedScore < minScore) {
+      violations.push({
+        responseId: r.responseId,
+        weightedScore: r.weightedScore,
+        minScore,
+        delta: parseFloat((r.weightedScore - minScore).toFixed(4)),
+      });
+    }
+  }
+  return violations;
+}
+
+/**
+ * Load a baseline EvaluationResult from a JSON file.
+ */
+export function loadBaseline(baselinePath: string): EvaluationResult {
+  const raw = fs.readFileSync(baselinePath, "utf-8");
+  return JSON.parse(raw) as EvaluationResult;
+}
+
+/**
+ * Compare current evaluation against a baseline run.
+ * Checks weighted score AND every rubric dimension per response.
+ *
+ * Responses are matched by responseId. Responses present in current
+ * but missing from baseline are skipped with a warning (not a failure).
+ *
+ * @param maxRegression — allowed score drop (default 0 = no regression allowed).
+ *                        E.g. 0.5 allows scores to drop by up to 0.5 points.
+ * @returns list of regression violations (empty = pass)
+ */
+export function checkRegression(
+  current: EvaluationResult,
+  baseline: EvaluationResult,
+  maxRegression = 0
+): RegressionViolation[] {
+  const violations: RegressionViolation[] = [];
+
+  const baselineById = new Map(
+    baseline.rankings.map(r => [r.responseId, r])
+  );
+
+  for (const curr of current.rankings) {
+    const base = baselineById.get(curr.responseId);
+    if (!base) continue; // new response, no baseline to compare
+
+    // Check weighted score
+    const wsDelta = curr.weightedScore - base.weightedScore;
+    if (wsDelta < -maxRegression) {
+      violations.push({
+        responseId: curr.responseId,
+        dimension: "weightedScore",
+        current: curr.weightedScore,
+        baseline: base.weightedScore,
+        delta: parseFloat(wsDelta.toFixed(4)),
+        allowedRegression: maxRegression,
+      });
+    }
+
+    // Check each rubric dimension
+    for (const dim of getRubricKeys()) {
+      const c = curr.scores[dim];
+      const b = base.scores[dim];
+      const delta = c - b;
+      if (delta < -maxRegression) {
+        violations.push({
+          responseId: curr.responseId,
+          dimension: dim,
+          current: c,
+          baseline: b,
+          delta: parseFloat(delta.toFixed(4)),
+          allowedRegression: maxRegression,
+        });
+      }
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * Format threshold violations for console / CI output.
+ */
+export function formatThresholdFailures(violations: ThresholdViolation[]): string {
+  if (violations.length === 0) return "";
+  const lines = ["", "❌ THRESHOLD CHECK FAILED", ""];
+  for (const v of violations) {
+    lines.push(
+      `  ${v.responseId}: weighted_score=${v.weightedScore} < min_score=${v.minScore} (delta ${v.delta > 0 ? "+" : ""}${v.delta})`
+    );
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+/**
+ * Format regression violations for console / CI output.
+ */
+export function formatRegressionFailures(violations: RegressionViolation[]): string {
+  if (violations.length === 0) return "";
+  const lines = ["", "❌ REGRESSION CHECK FAILED", ""];
+  for (const v of violations) {
+    const dim = v.dimension === "weightedScore" ? "weighted_score" : v.dimension;
+    lines.push(
+      `  ${v.responseId} / ${dim}: ${v.current} < ${v.baseline} ` +
+      `(delta ${v.delta > 0 ? "+" : ""}${v.delta}, allowed ≥ ${-v.allowedRegression})`
+    );
+  }
+  lines.push("");
+  return lines.join("\n");
 }
 
 // Re-export judge options for callers
