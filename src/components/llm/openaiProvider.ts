@@ -3,8 +3,8 @@
  * OpenAI concrete JudgeProvider — uses Structured Outputs for type safety.
  */
 
-import { JudgeRequest, JudgeResult, JudgeProviderConfig, RUBRIC_DIMENSIONS, RubricScores } from "../../types";
-import { JudgeProvider, validateJudgeScores, buildFallbackResult } from "./judgeProvider";
+import { JudgeRequest, JudgeResult, JudgeProviderConfig, RUBRIC_DIMENSIONS, RubricScores, TokenUsage } from "../../types";
+import { JudgeProvider, validateJudgeScores, buildFallbackResult, estimateCostUsd } from "./judgeProvider";
 import { buildJudgePrompt } from "./promptBuilder";
 
 const DEFAULT_MODEL = "gpt-4o-2024-08-06";
@@ -104,6 +104,19 @@ export class OpenAIJudgeProvider implements JudgeProvider {
           ? parsed.justification.trim()
           : "LLM judge returned no justification.";
 
+      // Token usage telemetry
+      const usage = body?.usage;
+      let tokens: TokenUsage | undefined;
+      let costUsd: number | undefined;
+      if (usage && typeof usage.prompt_tokens === "number") {
+        tokens = {
+          promptTokens: usage.prompt_tokens,
+          completionTokens: usage.completion_tokens ?? 0,
+          totalTokens: usage.total_tokens ?? (usage.prompt_tokens + (usage.completion_tokens ?? 0)),
+        };
+        costUsd = estimateCostUsd(tokens);
+      }
+
       return {
         responseId: request.responseId,
         scores,
@@ -111,6 +124,9 @@ export class OpenAIJudgeProvider implements JudgeProvider {
         rawProviderOutput: parsed,
         fallbackUsed: false,
         latencyMs: Date.now() - started,
+        cacheHit: false,
+        tokens,
+        costUsd,
       };
     } catch (err: any) {
       clearTimeout(timeout);

@@ -2,9 +2,10 @@
 
 import app from "./api/server";
 import { evaluate, evaluateAuto } from "./components/evaluator";
-import { exportToJSON, exportToCSV } from "./utils/exporter";
+import { exportResult, exportToJSON, exportToCSV, exportToMarkdown } from "./utils/exporter";
 import { EvaluationInput, Confidence } from "./types";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
+import { getCacheStats } from "./components/llm/judge";
 
 const PORT = process.env.PORT || 3000;
 const AUTO_JUDGE = (process.env.AUTO_JUDGE ?? "true").toLowerCase() !== "false";
@@ -74,6 +75,11 @@ async function getUserById(id) {
 async function runDemo() {
   console.log("\n=== AI Code Evaluator — Demo Result ===\n");
 
+  const cacheStats = getCacheStats();
+  if (!cacheStats.disabled && cacheStats.entries > 0) {
+    console.log(`📦 Cache: ${cacheStats.entries} entries at ${cacheStats.path}\n`);
+  }
+
   let result;
   if (AUTO_JUDGE && !process.env.OPENAI_API_KEY) {
     console.log("ℹ️  OPENAI_API_KEY not set — running demo with MockJudgeProvider\n");
@@ -98,14 +104,24 @@ async function runDemo() {
 
   console.log(JSON.stringify(result, null, 2));
 
+  if (result.telemetry) {
+    const t = result.telemetry;
+    console.log("\n--- Telemetry ---");
+    console.log(`Tokens: ${t.totalPromptTokens} prompt + ${t.totalCompletionTokens} completion = ${t.totalTokens} total`);
+    console.log(`Cache: ${t.cacheHits} hits / ${t.cacheMisses} misses`);
+    console.log(`Latency: ${t.totalLatencyMs}ms  |  Cost: $${t.estimatedCostUsd.toFixed(6)}  |  Savings: $${t.estimatedSavingsUsd.toFixed(6)}`);
+  }
+
   const jsonPath = exportToJSON(result, "./output");
   const csvPath = exportToCSV(result, "./output");
-  console.log(`\n✅ Exported JSON: ${jsonPath}`);
-  console.log(`✅ Exported CSV:  ${csvPath}`);
+  const mdPath = exportToMarkdown(result, "./output");
+  console.log(`\n✅ Exported JSON:     ${jsonPath}`);
+  console.log(`✅ Exported CSV:     ${csvPath}`);
+  console.log(`✅ Exported Markdown: ${mdPath}`);
 }
 
 // CLI mode: node dist/index.js --eval <input.json>
-// or: node dist/index.js --eval <input.json> --export csv
+// or: node dist/index.js --eval <input.json> --export json|csv|md
 async function runCli() {
   const args = process.argv.slice(2);
   const evalIdx = args.indexOf("--eval");
@@ -113,7 +129,7 @@ async function runCli() {
 
   const inputPath = args[evalIdx + 1];
   if (!inputPath) {
-    console.error("Usage: node dist/index.js --eval <input.json> [--export json|csv]");
+    console.error("Usage: node dist/index.js --eval <input.json> [--export json|csv|md]");
     process.exit(1);
   }
 
@@ -126,10 +142,18 @@ async function runCli() {
 
   console.log(JSON.stringify(result, null, 2));
 
+  if (result.telemetry) {
+    const t = result.telemetry;
+    console.error(
+      `\n# Telemetry: tokens=${t.totalTokens} cache=${t.cacheHits}/${t.cacheHits + t.cacheMisses} ` +
+      `latency=${t.totalLatencyMs}ms cost=$${t.estimatedCostUsd.toFixed(6)} savings=$${t.estimatedSavingsUsd.toFixed(6)}`
+    );
+  }
+
   const exportIdx = args.indexOf("--export");
   if (exportIdx !== -1) {
-    const format = args[exportIdx + 1] ?? "json";
-    const filepath = format === "csv" ? exportToCSV(result) : exportToJSON(result);
+    const format = (args[exportIdx + 1] ?? "json") as "json" | "csv" | "md" | "markdown";
+    const filepath = exportResult(result, format);
     console.log(`\n✅ Exported: ${filepath}`);
   }
   return true;
@@ -147,7 +171,7 @@ async function runCli() {
   app.listen(PORT, () => {
     console.log(`\n🚀 API server running at http://localhost:${PORT}`);
     console.log(`   POST /evaluate       — submit an evaluation (auto-judge if manualScores omitted)`);
-    console.log(`   POST /evaluate/export — evaluate + export to file`);
+    console.log(`   POST /evaluate/export — evaluate + export to file (format=json|csv|md)`);
     console.log(`   GET  /health         — health check`);
   });
 })();

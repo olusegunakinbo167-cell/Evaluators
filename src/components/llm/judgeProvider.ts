@@ -4,7 +4,7 @@
  * Completely abstracts underlying language model execution.
  */
 
-import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, getRubricKeys } from "../../types";
+import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, getRubricKeys, TokenUsage } from "../../types";
 
 /** Abstract judge provider — all LLM backends implement this. */
 export interface JudgeProvider {
@@ -72,7 +72,26 @@ export function buildFallbackResult(
       : "Judge fallback activated: provider payload unparseable or timed out. Neutral baseline scores applied.",
     fallbackUsed: true,
     latencyMs,
+    cacheHit: false,
   };
+}
+
+// ─── Token cost estimation ───────────────────────────────────────────────────
+
+/**
+ * Estimate USD cost for OpenAI gpt-4o class models.
+ * Input:  $2.50 / 1M tokens
+ * Output: $10.00 / 1M tokens
+ *
+ * Override with LLM_INPUT_COST_PER_M and LLM_OUTPUT_COST_PER_M env vars.
+ */
+export function estimateCostUsd(tokens: TokenUsage): number {
+  const inputCostPerM = parseFloat(process.env.LLM_INPUT_COST_PER_M || "2.5");
+  const outputCostPerM = parseFloat(process.env.LLM_OUTPUT_COST_PER_M || "10");
+  const cost =
+    (tokens.promptTokens / 1_000_000) * inputCostPerM +
+    (tokens.completionTokens / 1_000_000) * outputCostPerM;
+  return Math.round(cost * 1_000_000) / 1_000_000; // 6 decimal places
 }
 
 // ─── Retry / backoff ─────────────────────────────────────────────────────────

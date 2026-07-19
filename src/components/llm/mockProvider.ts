@@ -4,7 +4,7 @@
  */
 
 import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores } from "../../types";
-import { JudgeProvider } from "./judgeProvider";
+import { JudgeProvider, estimateCostUsd } from "./judgeProvider";
 
 export class MockJudgeProvider implements JudgeProvider {
   readonly name = "mock";
@@ -20,6 +20,7 @@ export class MockJudgeProvider implements JudgeProvider {
       promptAdherence: 7,
     };
 
+    const tokens = { promptTokens: 120, completionTokens: 45, totalTokens: 165 };
     return {
       responseId: request.responseId,
       scores,
@@ -27,6 +28,9 @@ export class MockJudgeProvider implements JudgeProvider {
       fallbackUsed: false,
       latencyMs: 1,
       rawProviderOutput: { scores },
+      cacheHit: false,
+      tokens,
+      costUsd: estimateCostUsd(tokens),
     };
   }
 }

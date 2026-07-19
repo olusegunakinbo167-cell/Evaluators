@@ -7,7 +7,7 @@ import {
   scoreWithRetry,
   JudgeProvider,
 } from "../src/components/llm/judgeProvider";
-import { judgeResponses } from "../src/components/llm/judge";
+import { judgeResponses, clearCache } from "../src/components/llm/judge";
 import { JudgeRequest, JudgeResult, RUBRIC_DIMENSIONS } from "../src/types";
 
 const baseScores = {
@@ -21,8 +21,15 @@ function mockResult(id: string, fallback = false, justification = "ok"): JudgeRe
     justification,
     fallbackUsed: fallback,
     latencyMs: 1,
+    cacheHit: false,
   };
 }
+
+// Clear cache before test suite, and disable cache by default
+beforeAll(() => {
+  process.env.LLM_DISABLE_CACHE = "true";
+  try { clearCache(); } catch {}
+});
 
 describe("backoffDelay", () => {
   beforeEach(() => {

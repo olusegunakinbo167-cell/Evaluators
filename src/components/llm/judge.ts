@@ -4,8 +4,8 @@
  * Executes the model against incoming code artifacts, validates JSON against
  * the active rubric, and falls back gracefully on failure.
  *
- * Includes concurrency throttling and exponential backoff retry to handle
- * CI batch evaluations safely under rate limits.
+ * Includes concurrency throttling, exponential backoff retry, local evaluation
+ * cache, and token telemetry to handle CI batch evaluations safely.
  */
 
 import {
@@ -15,9 +15,11 @@ import {
   RubricScores,
   RUBRIC_DIMENSIONS,
   JudgeProviderConfig,
+  EvaluationTelemetry,
 } from "../../types";
-import { JudgeProvider, JudgeRetryOptions, scoreWithRetry } from "./judgeProvider";
+import { JudgeProvider, JudgeRetryOptions, scoreWithRetry, estimateCostUsd } from "./judgeProvider";
 import { OpenAIJudgeProvider } from "./openaiProvider";
+import { getCached, setCached, cachedToJudgeResult } from "./cache";
 
 function getDefaultProvider(): JudgeProvider {
   // Test environment or explicit mock flag -> use mock
@@ -33,6 +35,8 @@ export interface JudgeOptions {
   concurrency?: number;
   /** Retry configuration — passed through to scoreWithRetry. */
   retry?: JudgeRetryOptions;
+  /** Disable cache for this run (overrides LLM_DISABLE_CACHE env). */
+  disableCache?: boolean;
 }
 
 function getConcurrencyLimit(override?: number): number {
@@ -78,11 +82,52 @@ async function pMap<T, R>(
 }
 
 /**
+ * Score a single response with cache lookup.
+ */
+async function scoreWithCache(
+  provider: JudgeProvider,
+  request: JudgeRequest,
+  config?: JudgeProviderConfig,
+  retryOptions?: JudgeRetryOptions,
+  disableCache = false
+): Promise<JudgeResult> {
+  const model = config?.model ?? process.env.OPENAI_JUDGE_MODEL ?? "gpt-4o-2024-08-06";
+
+  // Temporarily override cache disable env for this call if requested
+  const oldDisable = process.env.LLM_DISABLE_CACHE;
+  if (disableCache) process.env.LLM_DISABLE_CACHE = "true";
+
+  try {
+    const cached = getCached(request, model);
+    if (cached) {
+      return cachedToJudgeResult(cached, request.responseId);
+    }
+
+    const result = await scoreWithRetry(provider, request, config, retryOptions);
+
+    // Only cache successful (non-fallback) results
+    if (!result.fallbackUsed) {
+      setCached(request, result, model);
+    }
+
+    return result;
+  } finally {
+    if (disableCache) {
+      if (oldDisable === undefined) delete process.env.LLM_DISABLE_CACHE;
+      else process.env.LLM_DISABLE_CACHE = oldDisable;
+    }
+  }
+}
+
+/**
  * Score a set of code responses using the configured LLM judge.
  *
  * Features:
+ * - Local evaluation cache (.eval-cache.json) — deterministic hash of
+ *   code + prompt + rubric schema + model
  * - Concurrency throttling via LLM_MAX_CONCURRENCY (default 3)
  * - Exponential backoff retry with jitter via LLM_MAX_RETRIES (default 3)
+ * - Token usage / cost telemetry
  * - Graceful fallback to baseline scores on permanent failure
  *
  * @returns map of responseId → JudgeResult
@@ -107,7 +152,7 @@ export async function judgeResponses(
         language: r.language,
         rubricDimensions: RUBRIC_DIMENSIONS,
       };
-      const result = await scoreWithRetry(p, req, config, options?.retry);
+      const result = await scoreWithCache(p, req, config, options?.retry, options?.disableCache ?? false);
       return { id: r.id, result };
     },
     concurrency
@@ -134,11 +179,71 @@ export function extractJudgeScores(
   return { scores, justifications };
 }
 
-// Re-export retry utilities for direct use in evaluator / tests
+/**
+ * Aggregate telemetry across all judge results.
+ */
+export function aggregateTelemetry(
+  judgeResults: Record<string, JudgeResult>
+): EvaluationTelemetry {
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  let totalLatencyMs = 0;
+  let estimatedCostUsd = 0;
+  let estimatedSavingsUsd = 0;
+
+  for (const result of Object.values(judgeResults)) {
+    totalLatencyMs += result.latencyMs;
+
+    if (result.cacheHit) {
+      cacheHits++;
+      // Estimate savings: what WOULD this request have cost?
+      // costUsd is 0 for cache hits, so use token-based estimate
+      if (result.tokens) {
+        estimatedSavingsUsd += estimateCostUsd(result.tokens);
+      } else {
+        estimatedSavingsUsd += 0.0007; // ~165 tokens @ gpt-4o pricing
+      }
+    } else {
+      cacheMisses++;
+    }
+
+    if (result.tokens) {
+      totalPromptTokens += result.tokens.promptTokens;
+      totalCompletionTokens += result.tokens.completionTokens;
+    }
+    if (result.costUsd) {
+      estimatedCostUsd += result.costUsd;
+    }
+  }
+
+  return {
+    totalPromptTokens,
+    totalCompletionTokens,
+    totalTokens: totalPromptTokens + totalCompletionTokens,
+    cacheHits,
+    cacheMisses,
+    totalLatencyMs,
+    estimatedCostUsd: Math.round(estimatedCostUsd * 1_000_000) / 1_000_000,
+    estimatedSavingsUsd: Math.round(estimatedSavingsUsd * 1_000_000) / 1_000_000,
+  };
+}
+
+// Re-export retry / cache utilities for direct use in evaluator / tests
 export {
   scoreWithRetry,
   isRetryableJudgeError,
   backoffDelay,
   getRetryOptions,
+  estimateCostUsd,
   type JudgeRetryOptions,
 } from "./judgeProvider";
+
+export {
+  computeCacheKey,
+  getCached,
+  setCached,
+  clearCache,
+  getCacheStats,
+} from "./cache";

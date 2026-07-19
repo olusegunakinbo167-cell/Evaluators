@@ -10,6 +10,7 @@ import {
   getRubricKeys,
   RUBRIC_DIMENSIONS,
   JudgeProviderConfig,
+  EvaluationTelemetry,
 } from "../types";
 import {
   computeWeightedScore,
@@ -19,14 +20,17 @@ import {
   applySecurityPenalty,
 } from "../utils/scorer";
 import { scanForSecurityIssues } from "./securityScanner";
-import { judgeResponses, extractJudgeScores, JudgeOptions } from "./llm/judge";
+import { judgeResponses, extractJudgeScores, aggregateTelemetry, JudgeOptions } from "./llm/judge";
 import { JudgeProvider } from "./llm/judgeProvider";
 
 /**
  * Core synchronous evaluation — rubric scores must be provided.
  * Used internally after auto-judging, and exposed for manual-score workflows.
  */
-export function evaluate(input: EvaluationInput): EvaluationResult {
+export function evaluate(
+  input: EvaluationInput,
+  telemetry?: EvaluationTelemetry
+): EvaluationResult {
   const scoresMap = input.manualScores ?? {};
   const justificationsMap = input.justifications ?? {};
 
@@ -72,22 +76,26 @@ export function evaluate(input: EvaluationInput): EvaluationResult {
     preferred,
     confidence: effectiveConfidence,
     notes: input.notes,
+    telemetry,
   };
 }
 
 /**
  * LLM-as-a-Judge automated evaluation.
  *
- * 1. Runs the configured JudgeProvider against each code response with
+ * 1. Checks local evaluation cache (.eval-cache.json) before hitting provider
+ * 2. Runs the configured JudgeProvider against each code response with
  *    concurrency throttling (LLM_MAX_CONCURRENCY, default 3)
- * 2. Retries transient failures with exponential backoff + jitter
+ * 3. Retries transient failures with exponential backoff + jitter
  *    (LLM_MAX_RETRIES, default 3)
- * 3. Validates returned JSON strictly maps to active rubric keys
- * 4. Falls back to baseline schema defaults on unparseable/timeout
- * 5. Feeds judge scores into the standard evaluation pipeline
+ * 4. Validates returned JSON strictly maps to active rubric keys
+ * 5. Falls back to baseline schema defaults on unparseable/timeout
+ * 6. Captures token usage, latency, cache hit/miss, and cost telemetry
+ * 7. Feeds judge scores into the standard evaluation pipeline
  *
  * When manualScores are supplied they take precedence (judge is bypassed).
  * Set input.autoJudge = false to explicitly disable auto-scoring.
+ * Set LLM_DISABLE_CACHE=true to force clean runs.
  */
 export async function evaluateAuto(
   input: EvaluationInput,
@@ -100,6 +108,7 @@ export async function evaluateAuto(
 
   let scoresMap = input.manualScores ?? {};
   let justificationsMap = input.justifications ?? {};
+  let telemetry: EvaluationTelemetry | undefined;
 
   if (autoJudgeEnabled) {
     const judgeResults = await judgeResponses(
@@ -112,13 +121,17 @@ export async function evaluateAuto(
     const extracted = extractJudgeScores(judgeResults);
     scoresMap = extracted.scores;
     justificationsMap = extracted.justifications;
+    telemetry = aggregateTelemetry(judgeResults);
   }
 
-  return evaluate({
-    ...input,
-    manualScores: scoresMap,
-    justifications: justificationsMap,
-  });
+  return evaluate(
+    {
+      ...input,
+      manualScores: scoresMap,
+      justifications: justificationsMap,
+    },
+    telemetry
+  );
 }
 
 /** Validate a complete RubricScores object against the live rubric schema. */

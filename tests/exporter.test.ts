@@ -1,7 +1,7 @@
 // tests/exporter.test.ts
 import * as fs from "fs";
 import * as path from "path";
-import { exportToJSON, exportToCSV } from "../src/utils/exporter";
+import { exportToJSON, exportToCSV, exportToMarkdown } from "../src/utils/exporter";
 import { EvaluationResult, Confidence } from "../src/types";
 
 const result: EvaluationResult = {
@@ -16,6 +16,16 @@ const result: EvaluationResult = {
     scores: { correctness: 8, efficiency: 8, readability: 9, security: 9, promptAdherence: 8 },
     securityFlags: [], justification: "good",
   }],
+  telemetry: {
+    totalPromptTokens: 1200,
+    totalCompletionTokens: 300,
+    totalTokens: 1500,
+    cacheHits: 2,
+    cacheMisses: 1,
+    totalLatencyMs: 450,
+    estimatedCostUsd: 0.006,
+    estimatedSavingsUsd: 0.004,
+  },
 };
 
 const outDir = "./output-test";
@@ -39,6 +49,20 @@ describe("exporter", () => {
     expect(csv).toContain("task_id");
     expect(csv).toContain("EXP-TEST");
     expect(csv).toContain("A");
+  });
+
+  it("exports Markdown with telemetry table", () => {
+    const p = exportToMarkdown(result, outDir);
+    expect(fs.existsSync(p)).toBe(true);
+    const md = fs.readFileSync(p, "utf-8");
+    expect(md).toContain("# Evaluation Report");
+    expect(md).toContain("EXP-TEST");
+    expect(md).toContain("Execution Telemetry");
+    expect(md).toContain("Prompt tokens");
+    expect(md).toContain("1,200");
+    expect(md).toContain("Cache hits");
+    expect(md).toContain("Estimated cost");
+    expect(md).toContain("0.006");
   });
 
   it("creates output dir if missing", () => {

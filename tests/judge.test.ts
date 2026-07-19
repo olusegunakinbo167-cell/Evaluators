@@ -138,7 +138,7 @@ describe("judgeResponses orchestration", () => {
         responseId: "X",
         scores: { correctness: 6, efficiency: 6, readability: 6, security: 6, promptAdherence: 6 },
         justification: "ok",
-        fallbackUsed: false,
+        fallbackUsed: false, cacheHit: false,
         latencyMs: 1,
       },
     };

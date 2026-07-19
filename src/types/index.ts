@@ -94,6 +94,18 @@ export function getRubricKeys(): RubricDimensionKey[] {
   return RUBRIC_DIMENSIONS.map(d => d.key);
 }
 
+/**
+ * Stable fingerprint of the active rubric schema — used for cache invalidation.
+ * Bump RUBRIC_VERSION when dimension semantics change.
+ */
+export const RUBRIC_VERSION = "1.0.0";
+
+export function getRubricFingerprint(dimensions: RubricDimension[] = RUBRIC_DIMENSIONS): string {
+  return dimensions
+    .map(d => `${d.key}:${d.minScore}-${d.maxScore}:${d.weight}:${d.label}`)
+    .join("|");
+}
+
 export interface SecurityFlag {
   type: string;
   severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
@@ -116,6 +128,19 @@ export interface EvaluatedResponse {
   justification: string;
 }
 
+export interface EvaluationTelemetry {
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalTokens: number;
+  cacheHits: number;
+  cacheMisses: number;
+  totalLatencyMs: number;
+  /** Estimated cost in USD (OpenAI gpt-4o pricing: $2.50/1M input, $10/1M output). */
+  estimatedCostUsd: number;
+  /** Estimated cost saved via cache hits, USD. */
+  estimatedSavingsUsd: number;
+}
+
 export interface EvaluationResult {
   taskId: string;
   prompt: string;
@@ -125,6 +150,8 @@ export interface EvaluationResult {
   preferred: string;
   confidence: Confidence;
   notes?: string;
+  /** Execution telemetry (populated when LLM judge is used). */
+  telemetry?: EvaluationTelemetry;
 }
 
 export interface EvaluationInput {
@@ -159,6 +186,12 @@ export interface JudgeRequest {
   rubricDimensions: RubricDimension[];
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export interface JudgeResult {
   responseId: string;
   scores: RubricScores;
@@ -166,6 +199,12 @@ export interface JudgeResult {
   rawProviderOutput?: unknown;
   fallbackUsed: boolean;
   latencyMs: number;
+  /** Token usage (if reported by provider). */
+  tokens?: TokenUsage;
+  /** Whether this result was served from cache. */
+  cacheHit: boolean;
+  /** Estimated cost in USD for this single judgment. */
+  costUsd?: number;
 }
 
 export interface JudgeProviderConfig {

@@ -2,7 +2,7 @@
 
 import express, { Request, Response, NextFunction } from "express";
 import { evaluate, evaluateAuto } from "../components/evaluator";
-import { exportToJSON, exportToCSV } from "../utils/exporter";
+import { exportResult } from "../utils/exporter";
 import { EvaluationInput } from "../types";
 
 const app = express();
@@ -38,12 +38,12 @@ app.post("/evaluate", async (req: Request, res: Response) => {
 
 /**
  * POST /evaluate/export
- * Body: EvaluationInput + { format: "json" | "csv" }
+ * Body: EvaluationInput + { format: "json" | "csv" | "md" | "markdown" }
  * Returns: { filepath, result }
  */
 app.post("/evaluate/export", async (req: Request, res: Response) => {
   try {
-    const { format = "json", ...input }: EvaluationInput & { format?: string } = req.body;
+    const { format = "json", ...input }: EvaluationInput & { format?: "json" | "csv" | "md" | "markdown" } = req.body;
     const evalInput = input as EvaluationInput;
 
     const hasScores = evalInput.manualScores && Object.keys(evalInput.manualScores).length > 0;
@@ -51,8 +51,7 @@ app.post("/evaluate/export", async (req: Request, res: Response) => {
       ? evaluate(evalInput)
       : await evaluateAuto(evalInput);
 
-    const filepath =
-      format === "csv" ? exportToCSV(result) : exportToJSON(result);
+    const filepath = exportResult(result, format as any);
 
     return res.status(200).json({ filepath, result });
   } catch (err: any) {
