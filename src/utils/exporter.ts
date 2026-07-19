@@ -3,6 +3,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { EvaluationResult, EvaluationTelemetry } from "../types";
+import { ThresholdViolation, RegressionViolation } from "../components/evaluator";
 
 /**
  * Exports an evaluation result to a JSON file.
@@ -72,16 +73,30 @@ export function exportToCSV(result: EvaluationResult, outputDir: string = "./out
   return filepath;
 }
 
+export interface MarkdownReportOptions {
+  includeJustifications?: boolean;
+  includeTelemetry?: boolean;
+  thresholdViolations?: ThresholdViolation[];
+  regressionViolations?: RegressionViolation[];
+}
+
 /**
- * Exports an evaluation result to a Markdown report with telemetry breakdown.
- * Ideal for CI logs and pull request summaries.
+ * Build a Markdown evaluation report.
+ * Used by exportToMarkdown, GitHub Step Summary, and PR comments.
  */
-export function exportToMarkdown(result: EvaluationResult, outputDir: string = "./output"): string {
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+export function buildMarkdownReport(
+  result: EvaluationResult,
+  opts: MarkdownReportOptions = {}
+): string {
+  const {
+    includeJustifications = true,
+    includeTelemetry = true,
+    thresholdViolations = [],
+    regressionViolations = [],
+  } = opts;
 
   const lines: string[] = [];
+  const failed = thresholdViolations.length > 0 || regressionViolations.length > 0;
 
   lines.push(`# Evaluation Report — ${result.taskId}`);
   lines.push("");
@@ -92,7 +107,31 @@ export function exportToMarkdown(result: EvaluationResult, outputDir: string = "
   if (result.notes) {
     lines.push(`**Notes:** ${result.notes}`);
   }
+  if (failed) {
+    lines.push("");
+    lines.push(`> ❌ **Evaluation failed** — ${thresholdViolations.length} threshold violation(s), ${regressionViolations.length} regression(s)`);
+  }
   lines.push("");
+
+  // Failure summaries (for CI visibility)
+  if (thresholdViolations.length > 0) {
+    lines.push("## ❌ Threshold Violations");
+    lines.push("");
+    for (const v of thresholdViolations) {
+      lines.push(`- \`${v.responseId}\`: score **${v.weightedScore}** < min **${v.minScore}** (delta ${v.delta})`);
+    }
+    lines.push("");
+  }
+
+  if (regressionViolations.length > 0) {
+    lines.push("## ❌ Regression Violations");
+    lines.push("");
+    for (const v of regressionViolations) {
+      const dim = v.dimension === "weightedScore" ? "weighted_score" : v.dimension;
+      lines.push(`- \`${v.responseId} / ${dim}\`: **${v.current}** < **${v.baseline}** (delta ${v.delta}, allowed ≥ ${-v.allowedRegression})`);
+    }
+    lines.push("");
+  }
 
   // Rankings table
   lines.push("## Rankings");
@@ -107,24 +146,26 @@ export function exportToMarkdown(result: EvaluationResult, outputDir: string = "
   lines.push("");
 
   // Justifications
-  lines.push("## Justifications");
-  lines.push("");
-  for (const r of result.rankings) {
-    lines.push(`### ${r.responseId} (rank ${r.rank}, score ${r.weightedScore})`);
+  if (includeJustifications) {
+    lines.push("## Justifications");
     lines.push("");
-    lines.push(r.justification);
-    lines.push("");
-    if (r.securityFlags.length > 0) {
-      lines.push("**Security flags:**");
-      for (const f of r.securityFlags) {
-        lines.push(`- [${f.severity}] ${f.type}: ${f.description}`);
-      }
+    for (const r of result.rankings) {
+      lines.push(`### ${r.responseId} (rank ${r.rank}, score ${r.weightedScore})`);
       lines.push("");
+      lines.push(r.justification);
+      lines.push("");
+      if (r.securityFlags.length > 0) {
+        lines.push("**Security flags:**");
+        for (const f of r.securityFlags) {
+          lines.push(`- [${f.severity}] ${f.type}: ${f.description}`);
+        }
+        lines.push("");
+      }
     }
   }
 
   // Telemetry
-  if (result.telemetry) {
+  if (includeTelemetry && result.telemetry) {
     const t = result.telemetry;
     const totalRequests = t.cacheHits + t.cacheMisses;
     const hitRate = totalRequests > 0 ? ((t.cacheHits / totalRequests) * 100).toFixed(1) : "0";
@@ -149,11 +190,49 @@ export function exportToMarkdown(result: EvaluationResult, outputDir: string = "
     lines.push("");
   }
 
-  const content = lines.join("\n");
+  return lines.join("\n");
+}
+
+/**
+ * Exports an evaluation result to a Markdown report with telemetry breakdown.
+ * Ideal for CI logs and pull request summaries.
+ */
+export function exportToMarkdown(
+  result: EvaluationResult,
+  outputDir: string = "./output",
+  opts: MarkdownReportOptions = {}
+): string {
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  const content = buildMarkdownReport(result, opts);
   const filename = `${result.taskId}-${Date.now()}.md`;
   const filepath = path.join(outputDir, filename);
   fs.writeFileSync(filepath, content, "utf-8");
   return filepath;
+}
+
+/**
+ * Write evaluation summary to GitHub Actions step summary.
+ * No-op if not running in GitHub Actions.
+ */
+export function writeGitHubStepSummary(
+  result: EvaluationResult,
+  opts: MarkdownReportOptions = {}
+): boolean {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) return false;
+  try {
+    const markdown = buildMarkdownReport(result, {
+      includeJustifications: false,
+      ...opts,
+    });
+    fs.appendFileSync(summaryPath, markdown + "\n", "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -162,12 +241,13 @@ export function exportToMarkdown(result: EvaluationResult, outputDir: string = "
 export function exportResult(
   result: EvaluationResult,
   format: "json" | "csv" | "md" | "markdown" = "json",
-  outputDir = "./output"
+  outputDir = "./output",
+  markdownOpts?: MarkdownReportOptions
 ): string {
   switch (format) {
     case "csv": return exportToCSV(result, outputDir);
     case "md":
-    case "markdown": return exportToMarkdown(result, outputDir);
+    case "markdown": return exportToMarkdown(result, outputDir, markdownOpts);
     default: return exportToJSON(result, outputDir);
   }
 }

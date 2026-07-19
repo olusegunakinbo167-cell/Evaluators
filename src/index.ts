@@ -9,9 +9,18 @@ import {
   loadBaseline,
   formatThresholdFailures,
   formatRegressionFailures,
+  type ThresholdViolation,
+  type RegressionViolation,
 } from "./components/evaluator";
-import { exportResult, exportToJSON, exportToCSV, exportToMarkdown } from "./utils/exporter";
-import { EvaluationInput, Confidence } from "./types";
+import { exportResult, exportToJSON, exportToCSV, exportToMarkdown, writeGitHubStepSummary } from "./utils/exporter";
+import {
+  isGitHubActions,
+  emitThresholdAnnotations,
+  emitRegressionAnnotations,
+  postPrComment,
+  buildPrCommentBody,
+} from "./utils/github";
+import { EvaluationInput, Confidence, EvaluationResult } from "./types";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
 import { getCacheStats } from "./components/llm/judge";
 
@@ -28,6 +37,10 @@ function getArgFloat(args: string[], flag: string): number | undefined {
   if (v === undefined) return undefined;
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function hasFlag(args: string[], flag: string): boolean {
+  return args.includes(flag);
 }
 
 // ─── Demo: run a sample evaluation on startup ────────────────────────────────
@@ -144,6 +157,7 @@ async function runDemo() {
 //   [--export json|csv|md]
 //   [--min-score <float>]
 //   [--baseline <path> --max-regression <float>]
+//   [--gh-pr-comment]
 async function runCli() {
   const args = process.argv.slice(2);
   const evalIdx = args.indexOf("--eval");
@@ -155,7 +169,8 @@ async function runCli() {
       "Usage: node dist/index.js --eval <input.json> " +
       "[--export json|csv|md] " +
       "[--min-score <float>] " +
-      "[--baseline <path> --max-regression <float>]"
+      "[--baseline <path> --max-regression <float>] " +
+      "[--gh-pr-comment]"
     );
     process.exit(1);
   }
@@ -179,13 +194,19 @@ async function runCli() {
 
   // ─── Threshold / regression enforcement ──────────────────────────────
   let failed = false;
+  let thresholdViolations: ThresholdViolation[] = [];
+  let regressionViolations: RegressionViolation[] = [];
 
   const minScore = getArgFloat(args, "--min-score");
   if (minScore !== undefined) {
-    const violations = checkMinScore(result, minScore);
-    if (violations.length > 0) {
-      console.error(formatThresholdFailures(violations));
+    thresholdViolations = checkMinScore(result, minScore);
+    if (thresholdViolations.length > 0) {
+      console.error(formatThresholdFailures(thresholdViolations));
       failed = true;
+      // GitHub Actions workflow annotations
+      if (isGitHubActions()) {
+        emitThresholdAnnotations(thresholdViolations, inputPath);
+      }
     }
   }
 
@@ -194,10 +215,13 @@ async function runCli() {
     const maxRegression = getArgFloat(args, "--max-regression") ?? 0;
     try {
       const baseline = loadBaseline(baselinePath);
-      const regressions = checkRegression(result, baseline, maxRegression);
-      if (regressions.length > 0) {
-        console.error(formatRegressionFailures(regressions));
+      regressionViolations = checkRegression(result, baseline, maxRegression);
+      if (regressionViolations.length > 0) {
+        console.error(formatRegressionFailures(regressionViolations));
         failed = true;
+        if (isGitHubActions()) {
+          emitRegressionAnnotations(regressionViolations, inputPath);
+        }
       }
     } catch (err: any) {
       console.error(`\n❌ Failed to load baseline from ${baselinePath}: ${err?.message ?? err}\n`);
@@ -205,10 +229,41 @@ async function runCli() {
     }
   }
 
+  // ─── GitHub Actions step summary ─────────────────────────────────────
+  if (isGitHubActions()) {
+    const wrote = writeGitHubStepSummary(result, {
+      thresholdViolations,
+      regressionViolations,
+      includeJustifications: false,
+    });
+    if (wrote) {
+      console.error("\n📝 Wrote evaluation summary to $GITHUB_STEP_SUMMARY");
+    }
+  }
+
+  // ─── PR comment ──────────────────────────────────────────────────────
+  if (hasFlag(args, "--gh-pr-comment")) {
+    try {
+      const url = await postPrComment(
+        buildPrCommentBody(result, thresholdViolations, regressionViolations)
+      );
+      if (url) {
+        console.error(`\n💬 Posted PR comment: ${url}`);
+      } else {
+        console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");
+      }
+    } catch (err: any) {
+      console.error(`\n⚠️  PR comment failed: ${err?.message ?? err}`);
+    }
+  }
+
   // Export (always write output files, even on failure, for CI artifact upload)
   const exportFormat = getArg(args, "--export") as "json" | "csv" | "md" | "markdown" | undefined;
   if (exportFormat) {
-    const filepath = exportResult(result, exportFormat);
+    const filepath = exportResult(result, exportFormat, "./output", {
+      thresholdViolations,
+      regressionViolations,
+    });
     console.log(`\n✅ Exported: ${filepath}`);
   }
 
