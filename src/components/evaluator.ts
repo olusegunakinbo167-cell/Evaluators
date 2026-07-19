@@ -19,7 +19,7 @@ import {
   applySecurityPenalty,
 } from "../utils/scorer";
 import { scanForSecurityIssues } from "./securityScanner";
-import { judgeResponses, extractJudgeScores } from "./llm/judge";
+import { judgeResponses, extractJudgeScores, JudgeOptions } from "./llm/judge";
 import { JudgeProvider } from "./llm/judgeProvider";
 
 /**
@@ -78,10 +78,13 @@ export function evaluate(input: EvaluationInput): EvaluationResult {
 /**
  * LLM-as-a-Judge automated evaluation.
  *
- * 1. Runs the configured JudgeProvider against each code response
- * 2. Validates returned JSON strictly maps to active rubric keys
- * 3. Falls back to baseline schema defaults on unparseable/timeout
- * 4. Feeds judge scores into the standard evaluation pipeline
+ * 1. Runs the configured JudgeProvider against each code response with
+ *    concurrency throttling (LLM_MAX_CONCURRENCY, default 3)
+ * 2. Retries transient failures with exponential backoff + jitter
+ *    (LLM_MAX_RETRIES, default 3)
+ * 3. Validates returned JSON strictly maps to active rubric keys
+ * 4. Falls back to baseline schema defaults on unparseable/timeout
+ * 5. Feeds judge scores into the standard evaluation pipeline
  *
  * When manualScores are supplied they take precedence (judge is bypassed).
  * Set input.autoJudge = false to explicitly disable auto-scoring.
@@ -89,7 +92,8 @@ export function evaluate(input: EvaluationInput): EvaluationResult {
 export async function evaluateAuto(
   input: EvaluationInput,
   provider?: JudgeProvider,
-  judgeConfig?: JudgeProviderConfig
+  judgeConfig?: JudgeProviderConfig,
+  judgeOptions?: JudgeOptions
 ): Promise<EvaluationResult> {
   const autoJudgeEnabled =
     input.autoJudge !== false && (!input.manualScores || Object.keys(input.manualScores).length === 0);
@@ -98,7 +102,13 @@ export async function evaluateAuto(
   let justificationsMap = input.justifications ?? {};
 
   if (autoJudgeEnabled) {
-    const judgeResults = await judgeResponses(input.prompt, input.responses, provider, judgeConfig);
+    const judgeResults = await judgeResponses(
+      input.prompt,
+      input.responses,
+      provider,
+      judgeConfig,
+      judgeOptions
+    );
     const extracted = extractJudgeScores(judgeResults);
     scoresMap = extracted.scores;
     justificationsMap = extracted.justifications;
@@ -122,3 +132,6 @@ export function validateRubricPayload(candidate: unknown): candidate is RubricSc
   }
   return true;
 }
+
+// Re-export judge options for callers
+export type { JudgeOptions } from "./llm/judge";

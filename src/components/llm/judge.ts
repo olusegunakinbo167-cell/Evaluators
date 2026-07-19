@@ -3,6 +3,9 @@
  * LLM Judge orchestration layer.
  * Executes the model against incoming code artifacts, validates JSON against
  * the active rubric, and falls back gracefully on failure.
+ *
+ * Includes concurrency throttling and exponential backoff retry to handle
+ * CI batch evaluations safely under rate limits.
  */
 
 import {
@@ -13,7 +16,7 @@ import {
   RUBRIC_DIMENSIONS,
   JudgeProviderConfig,
 } from "../../types";
-import { JudgeProvider } from "./judgeProvider";
+import { JudgeProvider, JudgeRetryOptions, scoreWithRetry } from "./judgeProvider";
 import { OpenAIJudgeProvider } from "./openaiProvider";
 
 function getDefaultProvider(): JudgeProvider {
@@ -25,32 +28,92 @@ function getDefaultProvider(): JudgeProvider {
   return new OpenAIJudgeProvider();
 }
 
+export interface JudgeOptions {
+  /** Max concurrent outbound judge requests. Default from LLM_MAX_CONCURRENCY env, fallback 3. */
+  concurrency?: number;
+  /** Retry configuration — passed through to scoreWithRetry. */
+  retry?: JudgeRetryOptions;
+}
+
+function getConcurrencyLimit(override?: number): number {
+  if (typeof override === "number" && override > 0) return Math.floor(override);
+  const env = process.env.LLM_MAX_CONCURRENCY;
+  if (env) {
+    const n = parseInt(env, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 3;
+}
+
+/**
+ * Simple concurrency-limited map.
+ * Runs mapper over items with at most `concurrency` promises in flight.
+ */
+async function pMap<T, R>(
+  items: T[],
+  mapper: (item: T, index: number) => Promise<R>,
+  concurrency: number
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  let active = 0;
+
+  return new Promise<R[]>((resolve, reject) => {
+    const launch = () => {
+      if (nextIndex >= items.length && active === 0) {
+        resolve(results);
+        return;
+      }
+      while (active < concurrency && nextIndex < items.length) {
+        const idx = nextIndex++;
+        active++;
+        Promise.resolve(mapper(items[idx], idx))
+          .then(res => { results[idx] = res; })
+          .catch(reject)
+          .finally(() => { active--; launch(); });
+      }
+    };
+    launch();
+  });
+}
+
 /**
  * Score a set of code responses using the configured LLM judge.
- * Returns a map of responseId → JudgeResult.
+ *
+ * Features:
+ * - Concurrency throttling via LLM_MAX_CONCURRENCY (default 3)
+ * - Exponential backoff retry with jitter via LLM_MAX_RETRIES (default 3)
+ * - Graceful fallback to baseline scores on permanent failure
+ *
+ * @returns map of responseId → JudgeResult
  */
 export async function judgeResponses(
   taskPrompt: string,
   responses: CodeResponse[],
   provider?: JudgeProvider,
-  config?: JudgeProviderConfig
+  config?: JudgeProviderConfig,
+  options?: JudgeOptions
 ): Promise<Record<string, JudgeResult>> {
   const p = provider ?? getDefaultProvider();
-  const results: Record<string, JudgeResult> = {};
+  const concurrency = getConcurrencyLimit(options?.concurrency);
 
-  // Sequential scoring to respect rate limits — can be parallelized with a semaphore if needed
-  for (const r of responses) {
-    const req: JudgeRequest = {
-      taskPrompt,
-      responseId: r.id,
-      code: r.code,
-      language: r.language,
-      rubricDimensions: RUBRIC_DIMENSIONS,
-    };
-    results[r.id] = await p.score(req, config);
-  }
+  const results = await pMap(
+    responses,
+    async (r) => {
+      const req: JudgeRequest = {
+        taskPrompt,
+        responseId: r.id,
+        code: r.code,
+        language: r.language,
+        rubricDimensions: RUBRIC_DIMENSIONS,
+      };
+      const result = await scoreWithRetry(p, req, config, options?.retry);
+      return { id: r.id, result };
+    },
+    concurrency
+  );
 
-  return results;
+  return Object.fromEntries(results.map(x => [x.id, x.result]));
 }
 
 /**
@@ -70,3 +133,12 @@ export function extractJudgeScores(
 
   return { scores, justifications };
 }
+
+// Re-export retry utilities for direct use in evaluator / tests
+export {
+  scoreWithRetry,
+  isRetryableJudgeError,
+  backoffDelay,
+  getRetryOptions,
+  type JudgeRetryOptions,
+} from "./judgeProvider";
