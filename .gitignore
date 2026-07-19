@@ -4,3 +4,4 @@ output/
 .env
 coverage/
 *.js.map
+.eval-cache*.json
