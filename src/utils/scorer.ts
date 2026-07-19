@@ -8,30 +8,36 @@ import {
   SecurityFlag,
   RUBRIC_DIMENSIONS,
   Confidence,
+  RubricDimension,
+  buildWeights,
 } from "../types";
 
 /**
  * Computes a weighted score from a rubric score object.
+ * If weights is omitted, they are derived from the provided rubric dimensions,
+ * falling back to DEFAULT_WEIGHTS.
  */
 export function computeWeightedScore(
   scores: RubricScores,
-  weights: RubricWeights = DEFAULT_WEIGHTS
+  weights?: RubricWeights,
+  dimensions: RubricDimension[] = RUBRIC_DIMENSIONS
 ): number {
-  const weighted =
-    scores.correctness * weights.correctness +
-    scores.efficiency * weights.efficiency +
-    scores.readability * weights.readability +
-    scores.security * weights.security +
-    scores.promptAdherence * weights.promptAdherence;
-
-  return parseFloat(weighted.toFixed(2));
+  const w = weights ?? buildWeights(dimensions);
+  let total = 0;
+  for (const dim of dimensions) {
+    total += (scores[dim.key] ?? 0) * (w as any)[dim.key];
+  }
+  return parseFloat(total.toFixed(2));
 }
 
 /**
  * Validates that all rubric scores are within their declared bounds.
  */
-export function validateScores(scores: RubricScores): boolean {
-  for (const dim of RUBRIC_DIMENSIONS) {
+export function validateScores(
+  scores: RubricScores,
+  dimensions: RubricDimension[] = RUBRIC_DIMENSIONS
+): boolean {
+  for (const dim of dimensions) {
     const v = scores[dim.key];
     if (typeof v !== "number" || v < dim.minScore || v > dim.maxScore) {
       return false;

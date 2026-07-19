@@ -4,7 +4,7 @@
  * Completely abstracts underlying language model execution.
  */
 
-import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, getRubricKeys, TokenUsage } from "../../types";
+import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, RubricDimension, getRubricKeys, TokenUsage } from "../../types";
 
 /** Abstract judge provider — all LLM backends implement this. */
 export interface JudgeProvider {
@@ -20,15 +20,14 @@ export interface JudgeProvider {
  */
 export function validateJudgeScores(
   candidate: unknown,
-  minScore = 0,
-  maxScore = 10
+  dimensions?: RubricDimension[]
 ): RubricScores {
   if (typeof candidate !== "object" || candidate === null) {
     throw new Error("Judge scores payload is not an object");
   }
 
   const obj = candidate as Record<string, unknown>;
-  const rubricKeys = getRubricKeys();
+  const rubricKeys = getRubricKeys(dimensions);
   const validated: Partial<RubricScores> = {};
 
   for (const key of rubricKeys) {
@@ -36,10 +35,14 @@ export function validateJudgeScores(
     if (typeof v !== "number" || !Number.isFinite(v)) {
       throw new Error(`Judge score for "${key}" is not a finite number (got ${String(v)})`);
     }
+    // Find bounds for this dimension
+    const dim = dimensions?.find(d => d.key === key);
+    const minScore = dim?.minScore ?? 0;
+    const maxScore = dim?.maxScore ?? 10;
     if (v < minScore || v > maxScore) {
       throw new Error(`Judge score for "${key}" out of bounds [${minScore}, ${maxScore}]: ${v}`);
     }
-    // Clamp to integer rubric scale
+    // Clamp to 1 decimal place
     (validated as any)[key] = Math.round(v * 10) / 10;
   }
 

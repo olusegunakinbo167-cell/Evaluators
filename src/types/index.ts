@@ -84,14 +84,22 @@ export const DEFAULT_WEIGHTS: RubricWeights = {
   promptAdherence: 0.10,
 };
 
-export function getRubricDimension(key: RubricDimensionKey): RubricDimension {
-  const dim = RUBRIC_DIMENSIONS.find(d => d.key === key);
+export function getRubricDimension(key: RubricDimensionKey, dimensions: RubricDimension[] = RUBRIC_DIMENSIONS): RubricDimension {
+  const dim = dimensions.find(d => d.key === key);
   if (!dim) throw new Error(`Unknown rubric dimension: ${key}`);
   return dim;
 }
 
-export function getRubricKeys(): RubricDimensionKey[] {
-  return RUBRIC_DIMENSIONS.map(d => d.key);
+export function getRubricKeys(dimensions: RubricDimension[] = RUBRIC_DIMENSIONS): RubricDimensionKey[] {
+  return dimensions.map(d => d.key);
+}
+
+export function buildWeights(dimensions: RubricDimension[]): RubricWeights {
+  const w: Partial<RubricWeights> = {};
+  for (const d of dimensions) {
+    (w as any)[d.key] = d.weight;
+  }
+  return w as RubricWeights;
 }
 
 /**
@@ -104,6 +112,38 @@ export function getRubricFingerprint(dimensions: RubricDimension[] = RUBRIC_DIME
   return dimensions
     .map(d => `${d.key}:${d.minScore}-${d.maxScore}:${d.weight}:${d.label}`)
     .join("|");
+}
+
+/**
+ * Validate a rubric definition.
+ * - All 5 standard keys must be present exactly once
+ * - Weights should sum to ~1.0 (±0.001)
+ * - minScore < maxScore for each dimension
+ */
+export function validateRubric(dimensions: RubricDimension[]): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const expectedKeys: RubricDimensionKey[] = ["correctness", "efficiency", "readability", "security", "promptAdherence"];
+  const seen = new Set<string>();
+
+  for (const d of dimensions) {
+    if (seen.has(d.key)) errors.push(`Duplicate rubric key: ${d.key}`);
+    seen.add(d.key);
+    if (!expectedKeys.includes(d.key)) errors.push(`Unknown rubric key: ${d.key}`);
+    if (d.minScore >= d.maxScore) errors.push(`${d.key}: minScore (${d.minScore}) >= maxScore (${d.maxScore})`);
+    if (d.weight < 0) errors.push(`${d.key}: negative weight ${d.weight}`);
+    if (!d.label?.trim()) errors.push(`${d.key}: missing label`);
+  }
+
+  for (const k of expectedKeys) {
+    if (!seen.has(k)) errors.push(`Missing required rubric key: ${k}`);
+  }
+
+  const totalWeight = dimensions.reduce((s, d) => s + d.weight, 0);
+  if (Math.abs(totalWeight - 1.0) > 0.001) {
+    errors.push(`Rubric weights sum to ${totalWeight}, expected 1.0`);
+  }
+
+  return { valid: errors.length === 0, errors };
 }
 
 export interface SecurityFlag {
@@ -152,6 +192,8 @@ export interface EvaluationResult {
   notes?: string;
   /** Execution telemetry (populated when LLM judge is used). */
   telemetry?: EvaluationTelemetry;
+  /** Rubric used for this evaluation (if custom). */
+  rubric?: RubricDimension[];
 }
 
 export interface EvaluationInput {
@@ -169,6 +211,8 @@ export interface EvaluationInput {
   autoJudge?: boolean;
   /** Optional judge provider override. */
   judgeProvider?: "openai" | "mock";
+  /** Custom rubric dimensions. Defaults to RUBRIC_DIMENSIONS. */
+  rubric?: RubricDimension[];
 }
 
 // ─── LLM Judge Types ─────────────────────────────────────────────────────────
@@ -217,4 +261,34 @@ export interface JudgeProviderConfig {
 export interface JudgeProvider {
   readonly name: string;
   score(request: JudgeRequest, config?: JudgeProviderConfig): Promise<JudgeResult>;
+}
+
+// ─── Config / Suite Runner Types ─────────────────────────────────────────────
+
+export interface EvaluatorSuiteConfig {
+  /** Human-readable suite name (used in aggregated reports). */
+  name: string;
+  /** Glob(s) matching EvaluationInput JSON files. */
+  inputs: string | string[];
+  /** Path to a custom rubric JSON file (array of RubricDimension). */
+  rubric?: string;
+  /** Minimum weighted score threshold — failing responses cause exit code 1. */
+  minScore?: number;
+  /** Maximum allowed regression per dimension vs baseline. */
+  maxRegression?: number;
+  /** Path to baseline EvaluationResult JSON for regression comparison. */
+  baseline?: string;
+}
+
+export interface EvaluatorConfig {
+  /** List of evaluation suites to run. */
+  suites: EvaluatorSuiteConfig[];
+  /** Output directory for exported files. Default: ./output */
+  outputDir?: string;
+  /** Export format for suite results. Default: "md" */
+  exportFormat?: "json" | "csv" | "md" | "markdown";
+  /** Stop on first failing suite (default false — run all suites). */
+  failFast?: boolean;
+  /** Max concurrent suites (default unlimited — LLM_MAX_CONCURRENCY still throttles API calls). */
+  maxConcurrency?: number;
 }

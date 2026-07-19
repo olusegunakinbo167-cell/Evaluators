@@ -5,11 +5,13 @@ import {
   EvaluationInput,
   EvaluationResult,
   EvaluatedResponse,
-  DEFAULT_WEIGHTS,
   RubricScores,
   RubricDimensionKey,
+  RubricDimension,
   getRubricKeys,
   RUBRIC_DIMENSIONS,
+  buildWeights,
+  validateRubric,
   JudgeProviderConfig,
   EvaluationTelemetry,
 } from "../types";
@@ -32,6 +34,9 @@ export function evaluate(
   input: EvaluationInput,
   telemetry?: EvaluationTelemetry
 ): EvaluationResult {
+  const rubric = input.rubric ?? RUBRIC_DIMENSIONS;
+  const weights = buildWeights(rubric);
+
   const scoresMap = input.manualScores ?? {};
   const justificationsMap = input.justifications ?? {};
 
@@ -44,15 +49,15 @@ export function evaluate(
       throw new Error(`No rubric scores provided for response ID: ${response.id}`);
     }
 
-    if (!validateScores(scores)) {
-      const bounds = RUBRIC_DIMENSIONS.map(d => `${d.key} [${d.minScore}-${d.maxScore}]`).join(", ");
+    if (!validateScores(scores, rubric)) {
+      const bounds = rubric.map(d => `${d.key} [${d.minScore}-${d.maxScore}]`).join(", ");
       throw new Error(
         `Invalid scores for response "${response.id}": expected ${bounds}.`
       );
     }
 
     const securityFlags = scanForSecurityIssues(response.code);
-    const rawWeightedScore = computeWeightedScore(scores, DEFAULT_WEIGHTS);
+    const rawWeightedScore = computeWeightedScore(scores, weights, rubric);
     const penalizedScore = applySecurityPenalty(rawWeightedScore, securityFlags);
 
     partialRankings.push({
@@ -78,6 +83,7 @@ export function evaluate(
     confidence: effectiveConfidence,
     notes: input.notes,
     telemetry,
+    rubric: input.rubric,
   };
 }
 
@@ -104,6 +110,7 @@ export async function evaluateAuto(
   judgeConfig?: JudgeProviderConfig,
   judgeOptions?: JudgeOptions
 ): Promise<EvaluationResult> {
+  const rubric = input.rubric ?? RUBRIC_DIMENSIONS;
   const autoJudgeEnabled =
     input.autoJudge !== false && (!input.manualScores || Object.keys(input.manualScores).length === 0);
 
@@ -117,7 +124,8 @@ export async function evaluateAuto(
       input.responses,
       provider,
       judgeConfig,
-      judgeOptions
+      judgeOptions,
+      rubric
     );
     const extracted = extractJudgeScores(judgeResults);
     scoresMap = extracted.scores;
@@ -130,17 +138,21 @@ export async function evaluateAuto(
       ...input,
       manualScores: scoresMap,
       justifications: justificationsMap,
+      rubric,
     },
     telemetry
   );
 }
 
 /** Validate a complete RubricScores object against the live rubric schema. */
-export function validateRubricPayload(candidate: unknown): candidate is RubricScores {
+export function validateRubricPayload(
+  candidate: unknown,
+  dimensions: RubricDimension[] = RUBRIC_DIMENSIONS
+): candidate is RubricScores {
   if (typeof candidate !== "object" || candidate === null) return false;
   const obj = candidate as Record<string, unknown>;
-  for (const key of getRubricKeys() as RubricDimensionKey[]) {
-    const dim = RUBRIC_DIMENSIONS.find(d => d.key === key)!;
+  for (const key of getRubricKeys(dimensions) as RubricDimensionKey[]) {
+    const dim = dimensions.find(d => d.key === key)!;
     const v = obj[key];
     if (typeof v !== "number" || v < dim.minScore || v > dim.maxScore) return false;
   }
@@ -217,6 +229,9 @@ export function checkRegression(
     baseline.rankings.map(r => [r.responseId, r])
   );
 
+  // Use rubric keys from current result, fall back to default
+  const rubricKeys = getRubricKeys(current.rubric);
+
   for (const curr of current.rankings) {
     const base = baselineById.get(curr.responseId);
     if (!base) continue; // new response, no baseline to compare
@@ -235,9 +250,10 @@ export function checkRegression(
     }
 
     // Check each rubric dimension
-    for (const dim of getRubricKeys()) {
+    for (const dim of rubricKeys) {
       const c = curr.scores[dim];
-      const b = base.scores[dim];
+      const b = (base.scores as any)[dim];
+      if (typeof c !== "number" || typeof b !== "number") continue;
       const delta = c - b;
       if (delta < -maxRegression) {
         violations.push({

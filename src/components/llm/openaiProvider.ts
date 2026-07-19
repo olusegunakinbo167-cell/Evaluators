@@ -3,7 +3,7 @@
  * OpenAI concrete JudgeProvider — uses Structured Outputs for type safety.
  */
 
-import { JudgeRequest, JudgeResult, JudgeProviderConfig, RUBRIC_DIMENSIONS, RubricScores, TokenUsage } from "../../types";
+import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, TokenUsage } from "../../types";
 import { JudgeProvider, validateJudgeScores, buildFallbackResult, estimateCostUsd } from "./judgeProvider";
 import { buildJudgePrompt } from "./promptBuilder";
 
@@ -88,9 +88,7 @@ export class OpenAIJudgeProvider implements JudgeProvider {
 
       let scores: RubricScores;
       try {
-        const minScore = Math.min(...RUBRIC_DIMENSIONS.map(d => d.minScore));
-        const maxScore = Math.max(...RUBRIC_DIMENSIONS.map(d => d.maxScore));
-        scores = validateJudgeScores(parsed.scores, minScore, maxScore);
+        scores = validateJudgeScores(parsed.scores, request.rubricDimensions);
       } catch (e: any) {
         return buildFallbackResult(
           request.responseId,

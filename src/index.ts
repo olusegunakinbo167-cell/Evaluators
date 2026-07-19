@@ -1,5 +1,7 @@
 // src/index.ts
 
+import * as fs from "fs";
+import * as path from "path";
 import app from "./api/server";
 import {
   evaluate,
@@ -19,7 +21,10 @@ import {
   emitRegressionAnnotations,
   postPrComment,
   buildPrCommentBody,
+  appendStepSummary,
 } from "./utils/github";
+import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
+import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
 import { EvaluationInput, Confidence, EvaluationResult } from "./types";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
 import { getCacheStats } from "./components/llm/judge";
@@ -153,29 +158,12 @@ async function runDemo() {
   console.log(`✅ Exported Markdown: ${mdPath}`);
 }
 
-// CLI mode: node dist/index.js --eval <input.json>
-//   [--export json|csv|md]
-//   [--min-score <float>]
-//   [--baseline <path> --max-regression <float>]
-//   [--gh-pr-comment]
-async function runCli() {
-  const args = process.argv.slice(2);
-  const evalIdx = args.indexOf("--eval");
-  if (evalIdx === -1) return false;
+// ─── Single-file CLI mode ────────────────────────────────────────────────────
 
-  const inputPath = args[evalIdx + 1];
-  if (!inputPath) {
-    console.error(
-      "Usage: node dist/index.js --eval <input.json> " +
-      "[--export json|csv|md] " +
-      "[--min-score <float>] " +
-      "[--baseline <path> --max-regression <float>] " +
-      "[--gh-pr-comment]"
-    );
-    process.exit(1);
-  }
-
-  const fs = await import("fs");
+async function runSingleEval(
+  inputPath: string,
+  args: string[]
+): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[] }> {
   const raw = fs.readFileSync(inputPath, "utf-8");
   const input: EvaluationInput = JSON.parse(raw);
 
@@ -192,7 +180,6 @@ async function runCli() {
     );
   }
 
-  // ─── Threshold / regression enforcement ──────────────────────────────
   let failed = false;
   let thresholdViolations: ThresholdViolation[] = [];
   let regressionViolations: RegressionViolation[] = [];
@@ -203,7 +190,6 @@ async function runCli() {
     if (thresholdViolations.length > 0) {
       console.error(formatThresholdFailures(thresholdViolations));
       failed = true;
-      // GitHub Actions workflow annotations
       if (isGitHubActions()) {
         emitThresholdAnnotations(thresholdViolations, inputPath);
       }
@@ -229,35 +215,152 @@ async function runCli() {
     }
   }
 
-  // ─── GitHub Actions step summary ─────────────────────────────────────
+  return { result, failed, thresholdViolations, regressionViolations };
+}
+
+// ─── Config / multi-suite CLI mode ───────────────────────────────────────────
+
+async function runConfigMode(args: string[]): Promise<boolean> {
+  const configPath = getArg(args, "--config");
+  let config;
+  try {
+    config = loadEvaluatorConfig(configPath);
+  } catch (err: any) {
+    console.error(`\n❌ Config load failed: ${err?.message ?? err}\n`);
+    process.exit(1);
+  }
+
+  console.error(`\n🔧 Loaded config with ${config.suites.length} suite(s)\n`);
+
+  // CLI overrides apply to all suites
+  const cliOverrides = {
+    minScore: getArgFloat(args, "--min-score"),
+    maxRegression: getArgFloat(args, "--max-regression"),
+    baseline: getArg(args, "--baseline"),
+  };
+
+  // Apply CLI overrides to each suite
+  const suites = config.suites.map(s => applyCliOverrides(s, cliOverrides));
+
+  const multiResult = await runSuites(suites, {
+    minScore: cliOverrides.minScore,
+    maxRegression: cliOverrides.maxRegression,
+    baseline: cliOverrides.baseline,
+    failFast: config.failFast,
+  }, config.maxConcurrency);
+
+  // Print summary
+  console.log(`\n=== Suite Results: ${multiResult.totalPassed}/${multiResult.totalRuns} passed ===\n`);
+  for (const agg of multiResult.aggregates) {
+    const icon = agg.failed > 0 ? "❌" : "✅";
+    console.log(`  ${icon} ${agg.suiteName}: ${agg.passed}/${agg.total} passed`);
+  }
+  console.log("");
+
+  // Build unified Markdown report
+  const aggregatedMarkdown = buildAggregatedMarkdown(multiResult);
+
+  // Export unified report
+  if (!fs.existsSync(config.outputDir)) {
+    fs.mkdirSync(config.outputDir, { recursive: true });
+  }
+  const reportPath = path.join(config.outputDir, `suite-report-${Date.now()}.md`);
+  fs.writeFileSync(reportPath, aggregatedMarkdown, "utf-8");
+  console.log(`✅ Aggregated report: ${reportPath}\n`);
+
+  // GitHub Actions step summary
+  if (isGitHubActions()) {
+    const wrote = appendStepSummary(aggregatedMarkdown);
+    if (wrote) console.error("📝 Wrote aggregated summary to $GITHUB_STEP_SUMMARY");
+  }
+
+  // PR comment — aggregate across all suites
+  if (hasFlag(args, "--gh-pr-comment")) {
+    // Build a combined PR comment from all failed runs, or a success summary
+    const failedRuns = multiResult.aggregates.flatMap(a => a.runs.filter(r => r.failed));
+    let prBody = `## ${multiResult.failed ? "❌" : "✅"} Evaluation Suites — ${multiResult.totalPassed}/${multiResult.totalRuns} passed\n\n`;
+    prBody += "| Suite | Passed | Failed | Total |\n|-------|--------|--------|-------|\n";
+    for (const agg of multiResult.aggregates) {
+      prBody += `| ${agg.suiteName} | ${agg.passed} | ${agg.failed} | ${agg.total} |\n`;
+    }
+    prBody += "\n" + aggregatedMarkdown.split("\n").slice(0, 80).join("\n");
+    if (aggregatedMarkdown.length > 4000) prBody += "\n\n_…full report truncated, see CI artifacts_";
+
+    try {
+      const url = await postPrComment(prBody);
+      if (url) console.error(`\n💬 Posted PR comment: ${url}`);
+      else console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");
+    } catch (err: any) {
+      console.error(`\n⚠️  PR comment failed: ${err?.message ?? err}`);
+    }
+  }
+
+  // Export individual suite results if requested
+  const exportFormat = getArg(args, "--export") as "json" | "csv" | "md" | "markdown" | undefined;
+  if (exportFormat && exportFormat !== "md" && exportFormat !== "markdown") {
+    // Markdown aggregate already written; for json/csv export each run individually
+    console.error("⚠️  --export json/csv in config mode exports the aggregated markdown report only. Individual run exports are not yet supported.");
+  }
+
+  return multiResult.failed;
+}
+
+// ─── CLI entry ───────────────────────────────────────────────────────────────
+
+async function runCli() {
+  const args = process.argv.slice(2);
+
+  // Config mode: --config <path>  (also auto-detect evaluators.config.json)
+  const hasConfigFlag = hasFlag(args, "--config");
+  const hasEvalFlag = hasFlag(args, "--eval");
+  const configExists = fs.existsSync("evaluators.config.json") || fs.existsSync(".evaluators.json");
+
+  if (hasConfigFlag || (!hasEvalFlag && configExists)) {
+    const failed = await runConfigMode(args);
+    if (failed) process.exit(1);
+    return true;
+  }
+
+  // Single-file mode: --eval <input.json>
+  const evalIdx = args.indexOf("--eval");
+  if (evalIdx === -1) return false;
+
+  const inputPath = args[evalIdx + 1];
+  if (!inputPath) {
+    console.error(
+      "Usage:\n" +
+      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--gh-pr-comment]"
+    );
+    process.exit(1);
+  }
+
+  const { result, failed, thresholdViolations, regressionViolations } = await runSingleEval(inputPath, args);
+
+  // GitHub Actions step summary
   if (isGitHubActions()) {
     const wrote = writeGitHubStepSummary(result, {
       thresholdViolations,
       regressionViolations,
       includeJustifications: false,
     });
-    if (wrote) {
-      console.error("\n📝 Wrote evaluation summary to $GITHUB_STEP_SUMMARY");
-    }
+    if (wrote) console.error("\n📝 Wrote evaluation summary to $GITHUB_STEP_SUMMARY");
   }
 
-  // ─── PR comment ──────────────────────────────────────────────────────
+  // PR comment
   if (hasFlag(args, "--gh-pr-comment")) {
     try {
       const url = await postPrComment(
         buildPrCommentBody(result, thresholdViolations, regressionViolations)
       );
-      if (url) {
-        console.error(`\n💬 Posted PR comment: ${url}`);
-      } else {
-        console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");
-      }
+      if (url) console.error(`\n💬 Posted PR comment: ${url}`);
+      else console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");
     } catch (err: any) {
       console.error(`\n⚠️  PR comment failed: ${err?.message ?? err}`);
     }
   }
 
-  // Export (always write output files, even on failure, for CI artifact upload)
+  // Export
   const exportFormat = getArg(args, "--export") as "json" | "csv" | "md" | "markdown" | undefined;
   if (exportFormat) {
     const filepath = exportResult(result, exportFormat, "./output", {
@@ -267,10 +370,7 @@ async function runCli() {
     console.log(`\n✅ Exported: ${filepath}`);
   }
 
-  if (failed) {
-    process.exit(1);
-  }
-
+  if (failed) process.exit(1);
   return true;
 }
 

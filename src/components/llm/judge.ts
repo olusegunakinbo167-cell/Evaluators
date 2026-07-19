@@ -13,6 +13,7 @@ import {
   JudgeRequest,
   JudgeResult,
   RubricScores,
+  RubricDimension,
   RUBRIC_DIMENSIONS,
   JudgeProviderConfig,
   EvaluationTelemetry,
@@ -130,6 +131,7 @@ async function scoreWithCache(
  * - Token usage / cost telemetry
  * - Graceful fallback to baseline scores on permanent failure
  *
+ * @param rubric — optional custom rubric dimensions (defaults to RUBRIC_DIMENSIONS)
  * @returns map of responseId → JudgeResult
  */
 export async function judgeResponses(
@@ -137,7 +139,8 @@ export async function judgeResponses(
   responses: CodeResponse[],
   provider?: JudgeProvider,
   config?: JudgeProviderConfig,
-  options?: JudgeOptions
+  options?: JudgeOptions,
+  rubric: RubricDimension[] = RUBRIC_DIMENSIONS
 ): Promise<Record<string, JudgeResult>> {
   const p = provider ?? getDefaultProvider();
   const concurrency = getConcurrencyLimit(options?.concurrency);
@@ -150,7 +153,7 @@ export async function judgeResponses(
         responseId: r.id,
         code: r.code,
         language: r.language,
-        rubricDimensions: RUBRIC_DIMENSIONS,
+        rubricDimensions: rubric,
       };
       const result = await scoreWithCache(p, req, config, options?.retry, options?.disableCache ?? false);
       return { id: r.id, result };

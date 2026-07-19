@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/olusegunakinbo167-cell/Evaluators/main/evaluators.schema.json",
+  "suites": [
+    {
+      "name": "core-evaluations",
+      "inputs": "samples/**/*.json",
+      "minScore": 7.0,
+      "maxRegression": 0.3
+    }
+  ],
+  "outputDir": "./output",
+  "exportFormat": "md",
+  "failFast": false,
+  "maxConcurrency": 2
+}
