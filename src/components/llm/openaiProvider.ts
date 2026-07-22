@@ -1,48 +1,43 @@
 // src/components/llm/openaiProvider.ts
 /**
- * OpenAI concrete JudgeProvider — uses Structured Outputs for type safety.
+ * OpenAI-compatible JudgeProvider — uses Structured Outputs for type safety.
+ * Supports custom baseURL for Ollama, vLLM, OpenRouter, etc.
  */
 
-import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, TokenUsage } from "../../types";
+import { JudgeRequest, JudgeResult, JudgeProviderConfig, RubricScores, LlmEndpointConfig } from "../../types";
 import { JudgeProvider, validateJudgeScores, buildFallbackResult, estimateCostUsd } from "./judgeProvider";
 import { buildJudgePrompt } from "./promptBuilder";
-
-const DEFAULT_MODEL = "gpt-4o-2024-08-06";
-const DEFAULT_TIMEOUT_MS = 30_000;
+import { chatCompletions, resolveLlmConfig } from "./llmClient";
 
 export class OpenAIJudgeProvider implements JudgeProvider {
   readonly name = "openai";
 
   async score(request: JudgeRequest, config?: JudgeProviderConfig): Promise<JudgeResult> {
     const started = Date.now();
-    const apiKey = config?.apiKey ?? process.env.OPENAI_API_KEY;
-    const model = config?.model ?? process.env.OPENAI_JUDGE_MODEL ?? DEFAULT_MODEL;
-    const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    if (!apiKey) {
+    // Resolve full LLM config (baseURL, apiKey, headers, retries, etc.)
+    const llmConfig = resolveLlmConfig(config as LlmEndpointConfig | undefined);
+
+    // API key is optional for local endpoints (Ollama, etc.)
+    const needsAuth = llmConfig.baseURL.includes("openai.com") ||
+                      llmConfig.baseURL.includes("openrouter.ai");
+
+    if (needsAuth && !llmConfig.apiKey) {
+      const keyEnv = (config as LlmEndpointConfig | undefined)?.apiKeyEnv ?? "OPENAI_API_KEY";
       return buildFallbackResult(
         request.responseId,
         Date.now() - started,
-        "OPENAI_API_KEY not configured"
+        `${keyEnv} not configured for ${llmConfig.baseURL}`
       );
     }
 
     const prompt = buildJudgePrompt(request);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
     try {
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          temperature: config?.temperature ?? 0,
+      const body = await chatCompletions(
+        {
+          model: llmConfig.model,
+          temperature: llmConfig.temperature,
           messages: [
             { role: "system", content: prompt.system },
             { role: "user", content: prompt.user },
@@ -51,27 +46,16 @@ export class OpenAIJudgeProvider implements JudgeProvider {
             type: "json_schema",
             json_schema: prompt.jsonSchema,
           },
-        }),
-      });
+        },
+        config
+      );
 
-      clearTimeout(timeout);
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return buildFallbackResult(
-          request.responseId,
-          Date.now() - started,
-          `OpenAI HTTP ${res.status}: ${text.slice(0, 200)}`
-        );
-      }
-
-      const body = await res.json() as any;
       const content = body?.choices?.[0]?.message?.content;
       if (typeof content !== "string") {
         return buildFallbackResult(
           request.responseId,
           Date.now() - started,
-          "OpenAI response missing message content"
+          "LLM response missing message content"
         );
       }
 
@@ -104,7 +88,7 @@ export class OpenAIJudgeProvider implements JudgeProvider {
 
       // Token usage telemetry
       const usage = body?.usage;
-      let tokens: TokenUsage | undefined;
+      let tokens;
       let costUsd: number | undefined;
       if (usage && typeof usage.prompt_tokens === "number") {
         tokens = {
@@ -127,12 +111,12 @@ export class OpenAIJudgeProvider implements JudgeProvider {
         costUsd,
       };
     } catch (err: any) {
-      clearTimeout(timeout);
-      const isTimeout = err?.name === "AbortError";
+      // llmClient already exhausted retries at the HTTP layer
+      const msg = err?.message ?? String(err);
       return buildFallbackResult(
         request.responseId,
         Date.now() - started,
-        isTimeout ? `timed out after ${timeoutMs}ms` : (err?.message ?? String(err))
+        `LLM request failed: ${msg}`
       );
     }
   }

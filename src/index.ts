@@ -26,7 +26,7 @@ import {
 } from "./utils/github";
 import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
 import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
-import { EvaluationInput, Confidence, EvaluationResult } from "./types";
+import { EvaluationInput, Confidence, EvaluationResult, LlmEndpointConfig } from "./types";
 import { emitVarianceAnnotations, emitVarianceAnnotationsForResult, buildCiSummaryMarkdown } from "./utils/ciReporter";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
 import { getCacheStats } from "./components/llm/judge";
@@ -55,6 +55,52 @@ function getArgInt(args: string[], flag: string): number | undefined {
 
 function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
+}
+
+function parseLlmCliArgs(args: string[]): LlmEndpointConfig | undefined {
+  const llm: LlmEndpointConfig = {};
+  let hasAny = false;
+
+  const baseURL = getArg(args, "--llm-base-url");
+  if (baseURL) { llm.baseURL = baseURL; hasAny = true; }
+
+  const model = getArg(args, "--llm-model");
+  if (model) { llm.model = model; hasAny = true; }
+
+  const apiKeyEnv = getArg(args, "--llm-api-key-env");
+  if (apiKeyEnv) { llm.apiKeyEnv = apiKeyEnv; hasAny = true; }
+
+  const apiKey = getArg(args, "--llm-api-key");
+  if (apiKey) { llm.apiKey = apiKey; hasAny = true; }
+
+  const timeout = getArgFloat(args, "--llm-timeout");
+  if (timeout !== undefined) { llm.timeoutMs = Math.floor(timeout); hasAny = true; }
+
+  const temp = getArgFloat(args, "--llm-temperature");
+  if (temp !== undefined) { llm.temperature = temp; hasAny = true; }
+
+  const retries = getArgInt(args, "--llm-retries");
+  if (retries !== undefined) { llm.maxRetries = retries; hasAny = true; }
+
+  // Parse --llm-header "Key: Value" (repeatable)
+  const headers: Record<string, string> = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--llm-header" && i + 1 < args.length) {
+      const h = args[i + 1];
+      const colonIdx = h.indexOf(":");
+      if (colonIdx > 0) {
+        const key = h.slice(0, colonIdx).trim();
+        const value = h.slice(colonIdx + 1).trim();
+        if (key) headers[key] = value;
+      }
+    }
+  }
+  if (Object.keys(headers).length > 0) {
+    llm.headers = headers;
+    hasAny = true;
+  }
+
+  return hasAny ? llm : undefined;
 }
 
 // ─── Demo: run a sample evaluation on startup ────────────────────────────────
@@ -178,6 +224,7 @@ async function runSingleEval(
 
   const samples = Math.max(1, getArgInt(args, "--samples") ?? 1);
   const maxVariance = getArgFloat(args, "--max-variance");
+  const llmConfig = parseLlmCliArgs(args);
 
   const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
 
@@ -187,7 +234,7 @@ async function runSingleEval(
     const { computeVarianceStats } = await import("./components/suiteRunner.js");
     const allResults: EvaluationResult[] = [];
     for (let i = 0; i < samples; i++) {
-      const r = await evaluateAuto(input, undefined, undefined, { disableCache: true });
+      const r = await evaluateAuto(input, undefined, llmConfig, { disableCache: true });
       allResults.push(r);
     }
     const varianceReport = computeVarianceStats(allResults);
@@ -227,7 +274,7 @@ async function runSingleEval(
       varianceReport,
     };
   } else {
-    result = hasScores ? evaluate(input) : await evaluateAuto(input);
+    result = hasScores ? evaluate(input) : await evaluateAuto(input, undefined, llmConfig);
   }
 
   console.log(JSON.stringify(result, null, 2));
@@ -317,6 +364,7 @@ async function runConfigMode(args: string[]): Promise<boolean> {
     baseline: getArg(args, "--baseline"),
     samples: getArgInt(args, "--samples"),
     maxVariance: getArgFloat(args, "--max-variance"),
+    llm: parseLlmCliArgs(args),
   };
 
   // Apply CLI overrides to each suite
@@ -417,7 +465,11 @@ async function runCli() {
     console.error(
       "Usage:\n" +
       "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]\n" +
-      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]"
+      "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
+      "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]\n" +
+      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]\n" +
+      "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
+      "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]"
     );
     process.exit(1);
   }

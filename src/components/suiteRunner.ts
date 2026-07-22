@@ -10,6 +10,7 @@ import {
   EvaluationInput,
   EvaluationResult,
   EvaluationTelemetry,
+  LlmEndpointConfig,
   ResponseVariance,
   VarianceReport,
 } from "../types";
@@ -85,6 +86,7 @@ export interface SuiteRunOptions {
   samples?: number;
   maxVariance?: number;
   disableCache?: boolean;
+  llm?: LlmEndpointConfig;
 }
 
 function sumTelemetry(results: EvaluationResult[]): EvaluationTelemetry {
@@ -171,13 +173,14 @@ function computeVarianceStats(
 async function runWithVariance(
   input: EvaluationInput,
   samples: number,
-  disableCache: boolean
+  disableCache: boolean,
+  llmConfig?: LlmEndpointConfig
 ): Promise<{ result: EvaluationResult; allResults: EvaluationResult[] }> {
   if (samples <= 1) {
     const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
     const result = hasScores
       ? evaluate(input)
-      : await evaluateAuto(input, undefined, undefined, { disableCache });
+      : await evaluateAuto(input, undefined, llmConfig, { disableCache });
     return { result, allResults: [result] };
   }
 
@@ -186,7 +189,7 @@ async function runWithVariance(
     const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
     const r = hasScores
       ? evaluate(input)
-      : await evaluateAuto(input, undefined, undefined, { disableCache: true });
+      : await evaluateAuto(input, undefined, llmConfig, { disableCache: true });
     allResults.push(r);
   }
 
@@ -252,7 +255,7 @@ async function runSingleInput(
     const samples = Math.max(1, Math.floor(opts.samples ?? 1));
     const disableCache = opts.disableCache ?? samples > 1;
 
-    const { result } = await runWithVariance(input, samples, disableCache);
+    const { result } = await runWithVariance(input, samples, disableCache, opts.llm);
 
     let thresholdViolations: ThresholdViolation[] = [];
     let regressionViolations: RegressionViolation[] = [];
@@ -337,6 +340,7 @@ async function runSuite(
     samples: cliOverrides.samples ?? suite.samples,
     maxVariance: cliOverrides.maxVariance ?? suite.maxVariance,
     disableCache: cliOverrides.disableCache,
+    llm: { ...(suite.llm ?? {}), ...(cliOverrides.llm ?? {}) },
   };
 
   const runs: SuiteRunResult[] = [];

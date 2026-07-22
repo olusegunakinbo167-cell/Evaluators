@@ -7,6 +7,7 @@ import * as path from "path";
 import {
   EvaluatorConfig,
   EvaluatorSuiteConfig,
+  LlmEndpointConfig,
   RubricDimension,
   validateRubric,
 } from "../types";
@@ -16,6 +17,8 @@ export interface ResolvedSuiteConfig extends Omit<EvaluatorSuiteConfig, "inputs"
   inputFiles: string[];
   rubricPath?: string;
   rubric?: RubricDimension[];
+  /** Resolved LLM endpoint config (suite-level overrides global). */
+  llm?: LlmEndpointConfig;
 }
 
 export interface ResolvedEvaluatorConfig {
@@ -24,6 +27,8 @@ export interface ResolvedEvaluatorConfig {
   exportFormat: "json" | "csv" | "md" | "markdown";
   failFast: boolean;
   maxConcurrency?: number;
+  /** Global LLM endpoint config. */
+  llm?: LlmEndpointConfig;
 }
 
 /**
@@ -102,6 +107,74 @@ export function loadRubricFile(rubricPath: string): RubricDimension[] {
   return data;
 }
 
+/**
+ * Merge two LLM endpoint configs — child overrides parent.
+ * Headers are deep-merged (child keys override parent keys).
+ */
+export function mergeLlmConfig(
+  parent?: LlmEndpointConfig,
+  child?: LlmEndpointConfig
+): LlmEndpointConfig | undefined {
+  if (!parent && !child) return undefined;
+  return {
+    ...parent,
+    ...child,
+    headers: {
+      ...(parent?.headers ?? {}),
+      ...(child?.headers ?? {}),
+    },
+  };
+}
+
+/**
+ * Validate an LLM endpoint config object.
+ * Returns an array of error messages (empty = valid).
+ */
+export function validateLlmConfig(
+  llm: LlmEndpointConfig | undefined,
+  context: string
+): string[] {
+  if (!llm) return [];
+  const errors: string[] = [];
+
+  if (llm.baseURL !== undefined) {
+    try {
+      const u = new URL(llm.baseURL);
+      if (!["http:", "https:"].includes(u.protocol)) {
+        errors.push(`${context}: llm.baseURL must be http:// or https:// (got ${llm.baseURL})`);
+      }
+    } catch {
+      errors.push(`${context}: llm.baseURL is not a valid URL: ${llm.baseURL}`);
+    }
+  }
+
+  if (llm.apiKeyEnv !== undefined && !/^[A-Z_][A-Z0-9_]*$/i.test(llm.apiKeyEnv)) {
+    errors.push(`${context}: llm.apiKeyEnv must be a valid environment variable name`);
+  }
+
+  if (llm.headers !== undefined) {
+    if (typeof llm.headers !== "object" || Array.isArray(llm.headers)) {
+      errors.push(`${context}: llm.headers must be an object`);
+    } else {
+      for (const [k, v] of Object.entries(llm.headers)) {
+        if (typeof v !== "string") {
+          errors.push(`${context}: llm.headers["${k}"] must be a string`);
+        }
+      }
+    }
+  }
+
+  if (llm.timeoutMs !== undefined && (llm.timeoutMs < 100 || llm.timeoutMs > 600_000)) {
+    errors.push(`${context}: llm.timeoutMs must be between 100 and 600000`);
+  }
+
+  if (llm.maxRetries !== undefined && (llm.maxRetries < 0 || llm.maxRetries > 20)) {
+    errors.push(`${context}: llm.maxRetries must be between 0 and 20`);
+  }
+
+  return errors;
+}
+
 export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfig {
   const candidates = [
     configPath,
@@ -129,6 +202,12 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
     throw new Error(`Config ${foundPath}: "suites" must be a non-empty array`);
   }
 
+  // Validate global LLM config
+  const globalLlmErrors = validateLlmConfig(config.llm, "config.llm");
+  if (globalLlmErrors.length > 0) {
+    throw new Error(`Config ${foundPath} LLM validation failed:\n  - ${globalLlmErrors.join("\n  - ")}`);
+  }
+
   const suites: ResolvedSuiteConfig[] = [];
 
   for (const [idx, suite] of config.suites.entries()) {
@@ -146,6 +225,15 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
       rubric = loadRubricFile(rubricPath);
     }
 
+    // Validate suite-level LLM config
+    const suiteLlmErrors = validateLlmConfig(suite.llm, `suites["${suite.name}"].llm`);
+    if (suiteLlmErrors.length > 0) {
+      throw new Error(`Config ${foundPath} LLM validation failed:\n  - ${suiteLlmErrors.join("\n  - ")}`);
+    }
+
+    // Merge global LLM config with suite-level override
+    const llm = mergeLlmConfig(config.llm, suite.llm);
+
     suites.push({
       name: suite.name,
       inputFiles,
@@ -156,6 +244,7 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
       baseline: suite.baseline ? path.resolve(configDir, suite.baseline) : undefined,
       samples: suite.samples,
       maxVariance: suite.maxVariance,
+      llm,
     });
   }
 
@@ -165,6 +254,7 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
     exportFormat: (config.exportFormat ?? "md") as "json" | "csv" | "md" | "markdown",
     failFast: config.failFast ?? false,
     maxConcurrency: config.maxConcurrency,
+    llm: config.llm,
   };
 }
 
@@ -180,6 +270,7 @@ export function applyCliOverrides(
     baseline?: string;
     samples?: number;
     maxVariance?: number;
+    llm?: LlmEndpointConfig;
   }
 ): ResolvedSuiteConfig {
   return {
@@ -189,5 +280,6 @@ export function applyCliOverrides(
     baseline: overrides.baseline ?? suite.baseline,
     samples: overrides.samples ?? suite.samples,
     maxVariance: overrides.maxVariance ?? suite.maxVariance,
+    llm: mergeLlmConfig(suite.llm, overrides.llm),
   };
 }

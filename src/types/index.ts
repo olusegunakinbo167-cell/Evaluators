@@ -274,12 +274,38 @@ export interface JudgeResult {
   costUsd?: number;
 }
 
-export interface JudgeProviderConfig {
+/**
+ * OpenAI-compatible LLM endpoint configuration.
+ * Supports custom baseURL for Ollama, vLLM, OpenRouter, etc.
+ */
+export interface LlmEndpointConfig {
+  /** Base URL for OpenAI-compatible API (e.g. http://localhost:11434/v1, https://openrouter.ai/api/v1). Defaults to https://api.openai.com/v1 */
+  baseURL?: string;
+  /** Name of the environment variable containing the API key. Defaults to "OPENAI_API_KEY". */
+  apiKeyEnv?: string;
+  /** API key value directly (overrides apiKeyEnv). Use apiKeyEnv in config files for security. */
   apiKey?: string;
+  /** Custom HTTP headers to send with every request (e.g. {"HTTP-Referer": "https://example.com", "X-Title": "My App"}). */
+  headers?: Record<string, string>;
+  /** Model name to use. Default: gpt-4o-2024-08-06 */
   model?: string;
+  /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
+  /** Sampling temperature. Default: 0 */
   temperature?: number;
+  /** Maximum number of retry attempts for transient failures (429, 5xx, timeouts). Default: 3 */
+  maxRetries?: number;
+  /** Base delay (ms) for exponential backoff. Default: 500 */
+  retryBaseMs?: number;
+  /** Maximum backoff delay cap (ms). Default: 8000 */
+  retryMaxMs?: number;
 }
+
+/**
+ * Judge provider configuration — extends LLM endpoint config.
+ * @deprecated Use LlmEndpointConfig. Kept for backwards compatibility.
+ */
+export interface JudgeProviderConfig extends LlmEndpointConfig {}
 
 export interface JudgeProvider {
   readonly name: string;
@@ -305,6 +331,8 @@ export interface EvaluatorSuiteConfig {
   samples?: number;
   /** Maximum allowed standard deviation across samples — exceeding causes failure. */
   maxVariance?: number;
+  /** LLM endpoint configuration override for this suite. */
+  llm?: LlmEndpointConfig;
 }
 
 export interface EvaluatorConfig {
@@ -318,4 +346,6 @@ export interface EvaluatorConfig {
   failFast?: boolean;
   /** Max concurrent suites (default unlimited — LLM_MAX_CONCURRENCY still throttles API calls). */
   maxConcurrency?: number;
+  /** Global LLM endpoint configuration (suite-level llm config overrides this). */
+  llm?: LlmEndpointConfig;
 }
