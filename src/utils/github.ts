@@ -298,3 +298,254 @@ export function buildPrCommentBody(
   lines.push(`<sub>Generated at ${result.timestamp} — <a href="https://github.com/olusegunakinbo167-cell/Evaluators">ai-code-evaluator</a></sub>`);
   return lines.join("\n");
 }
+// Append to src/utils/github.ts after buildPrCommentBody
+
+/**
+ * Build a PR comment body from a MultiSuiteResult.
+ * Includes variance, calibration, cost, and robustness summaries with
+ * pass/fail badges and collapsible details for undetected mutations.
+ */
+export function buildMultiSuitePrCommentBody(
+  result: import("../components/suiteRunner").MultiSuiteResult,
+  options: {
+    markdown?: string;
+    includeMutations?: boolean;
+    /** Baseline artifact for comparison (renders Baseline vs Current diff table). */
+    baseline?: import("../types").MultiSuiteArtifact;
+  } = {}
+): string {
+  const { totalPassed, totalFailed, totalRuns } = result;
+  const failed = totalFailed > 0;
+  const statusEmoji = failed ? "❌" : "✅";
+
+  const lines: string[] = [];
+  lines.push(`## ${statusEmoji} AI Code Evaluator — ${totalPassed}/${totalRuns} passed`);
+  lines.push("");
+
+  const badges: string[] = [];
+  badges.push(failed ? "❌ **FAILED**" : "✅ **PASSED**");
+
+  if (result.tokenStats) {
+    const ts = result.tokenStats;
+    badges.push(`💰 $${ts.totalCostUsd.toFixed(4)}`);
+    badges.push(`🔤 ${ts.totalTokens.toLocaleString()} tokens`);
+    if (ts.cacheHits + ts.cacheMisses > 0) {
+      const hitRate = ((ts.cacheHits / (ts.cacheHits + ts.cacheMisses)) * 100).toFixed(0);
+      badges.push(`⚡ ${hitRate}% cache`);
+    }
+  }
+
+  const allRuns = result.aggregates.flatMap(a => a.runs);
+  const varianceRuns = allRuns.filter(r => r.result.varianceReport);
+  if (varianceRuns.length > 0) {
+    const maxStddev = Math.max(...varianceRuns.map(r => r.result.varianceReport!.maxStddev));
+    const meanStddev = varianceRuns.reduce((s, r) => s + r.result.varianceReport!.meanStddev, 0) / varianceRuns.length;
+    const varIcon = maxStddev > 1.0 ? "⚠️" : "📊";
+    badges.push(`${varIcon} σ max=${maxStddev.toFixed(3)} mean=${meanStddev.toFixed(3)}`);
+  }
+
+  const calRuns = allRuns.filter(r => r.result.calibrationReport && r.result.calibrationReport.n > 0);
+  if (calRuns.length > 0) {
+    const correlations = calRuns.map(r => r.result.calibrationReport!.pearsonR).filter(Number.isFinite);
+    const meanR = correlations.length > 0 ? correlations.reduce((a, b) => a + b, 0) / correlations.length : NaN;
+    const minR = correlations.length > 0 ? Math.min(...correlations) : NaN;
+    const calIcon = Number.isFinite(minR) && minR >= 0.75 ? "🎯" : "⚠️";
+    const rStr = Number.isFinite(meanR) ? meanR.toFixed(3) : "N/A";
+    badges.push(`${calIcon} r=${rStr}`);
+  }
+
+  const robRuns = allRuns.filter(r => r.result.robustnessReport);
+  if (robRuns.length > 0) {
+    const scores = robRuns.map(r => r.result.robustnessReport!.robustnessScore);
+    const meanScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const minScore = Math.min(...scores);
+    const detectionRates = robRuns.map(r => r.result.robustnessReport!.detectionRate);
+    const meanDetection = detectionRates.reduce((a, b) => a + b, 0) / detectionRates.length;
+    const robIcon = minScore >= 6.0 ? "🛡️" : "⚠️";
+    badges.push(`${robIcon} robustness ${meanScore.toFixed(1)}/10 (${(meanDetection * 100).toFixed(0)}% detected)`);
+  }
+
+  lines.push(badges.join(" · "));
+  lines.push("");
+
+  lines.push("| Suite | Passed | Failed | Total | Status |");
+  lines.push("|-------|--------|--------|-------|--------|");
+  for (const agg of result.aggregates) {
+    const icon = agg.failed > 0 ? "❌" : "✅";
+    lines.push(`| ${agg.suiteName} | ${agg.passed} | ${agg.failed} | ${agg.total} | ${icon} |`);
+  }
+  lines.push("");
+
+  if (calRuns.length > 0) {
+    lines.push("<details><summary>🎯 Judge Calibration</summary>");
+    lines.push("");
+    lines.push("| Task | Correlation r | MAE | Agreement | N | Status |");
+    lines.push("|------|----------------|-----|-----------|---|--------|");
+    for (const run of calRuns) {
+      const cr = run.result.calibrationReport!;
+      const failed = run.calibrationViolations.length > 0;
+      const icon = failed ? "❌" : "✅";
+      const rStr = Number.isFinite(cr.pearsonR) ? cr.pearsonR.toFixed(3) : "N/A";
+      lines.push(`| ${run.result.taskId} | ${rStr} | ${cr.mae.toFixed(2)} | ${cr.agreementPct.toFixed(1)}% | ${cr.n} | ${icon} |`);
+    }
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  if (robRuns.length > 0) {
+    lines.push("<details><summary>🛡️ Judge Robustness (Mutation Testing)</summary>");
+    lines.push("");
+    lines.push("| Task | Score | Detection | Mutations | Status |");
+    lines.push("|------|-------|-----------|-----------|--------|");
+    for (const run of robRuns) {
+      const rr = run.result.robustnessReport!;
+      const failed = run.robustnessViolations.length > 0;
+      const icon = failed ? "❌" : "✅";
+      lines.push(
+        `| ${run.result.taskId} | ${rr.robustnessScore.toFixed(1)}/10 | ${(rr.detectionRate * 100).toFixed(0)}% | ${rr.detectedMutations}/${rr.totalMutations} | ${icon} |`
+      );
+    }
+    lines.push("");
+
+    const allUndetected = robRuns.flatMap(run =>
+      (run.result.robustnessReport?.undetected ?? []).map(u => ({ ...u, taskId: run.result.taskId }))
+    );
+
+    if (allUndetected.length > 0 && options.includeMutations !== false) {
+      lines.push("<details><summary>⚠️ Undetected Mutations (click to expand)</summary>");
+      lines.push("");
+      lines.push("| Task | Mutation | Kind | Orig | Mut | Drop |");
+      lines.push("|------|----------|------|------|-----|------|");
+      const sorted = allUndetected.sort((a, b) => a.scoreDrop - b.scoreDrop).slice(0, 20);
+      for (const u of sorted) {
+        lines.push(
+          `| ${u.taskId} | ${u.mutationId} | ${u.kind} | ${u.originalScore} | ${u.mutatedScore} | ${u.scoreDrop.toFixed(2)} |`
+        );
+      }
+      if (allUndetected.length > sorted.length) {
+        lines.push("");
+        lines.push(`_…and ${allUndetected.length - sorted.length} more — see full CI report_`);
+      }
+      lines.push("");
+      lines.push("</details>");
+      lines.push("");
+    }
+
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  if (varianceRuns.length > 0) {
+    lines.push("<details><summary>📊 Variance Report</summary>");
+    lines.push("");
+    lines.push("| Task | Response | Samples | Mean | σ | Min | Max |");
+    lines.push("|------|----------|---------|------|---|-----|-----|");
+    for (const run of varianceRuns) {
+      const vr = run.result.varianceReport!;
+      for (const resp of vr.responses.slice(0, 10)) {
+        lines.push(
+          `| ${run.result.taskId} | ${resp.responseId} | ${resp.samples} | ${resp.mean} | ${resp.stddev} | ${resp.min} | ${resp.max} |`
+        );
+      }
+    }
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  // --- Baseline vs Current comparison ---
+  if (options.baseline) {
+    lines.push("## 📊 Baseline vs Current");
+    lines.push("");
+
+    // Build baseline lookup: taskId → result
+    const baselineByTask = new Map<string, any>();
+    for (const agg of options.baseline.result.aggregates || []) {
+      for (const run of agg.runs || []) {
+        baselineByTask.set(run.taskId, run.result);
+      }
+    }
+
+    // Collect comparison data
+    const comparisons: Array<{
+      taskId: string;
+      currentScore: number;
+      baselineScore: number;
+      scoreDelta: number;
+      currentR?: number;
+      baselineR?: number;
+      correlationDelta?: number;
+      currentCost: number;
+      baselineCost: number;
+      costDelta: number;
+    }> = [];
+
+    for (const run of allRuns) {
+      const taskId = run.result.taskId;
+      const baseResult = baselineByTask.get(taskId);
+      if (!baseResult) continue;
+
+      const currScore = run.result.rankings[0]?.weightedScore ?? 0;
+      const baseScore = baseResult.rankings?.[0]?.weightedScore ?? 0;
+      const currR = run.result.calibrationReport?.pearsonR;
+      const baseR = baseResult.calibrationReport?.pearsonR;
+      const currCost = run.result.telemetry?.estimatedCostUsd ?? 0;
+      const baseCost = baseResult.telemetry?.estimatedCostUsd ?? 0;
+
+      comparisons.push({
+        taskId,
+        currentScore: currScore,
+        baselineScore: baseScore,
+        scoreDelta: currScore - baseScore,
+        currentR: currR,
+        baselineR: baseR,
+        correlationDelta: (currR !== undefined && baseR !== undefined) ? currR - baseR : undefined,
+        currentCost: currCost,
+        baselineCost: baseCost,
+        costDelta: currCost - baseCost,
+      });
+    }
+
+    if (comparisons.length > 0) {
+      lines.push("| Task | Score Δ | Correlation Δ | Cost Δ | Status |");
+      lines.push("|------|---------|---------------|--------|--------|");
+      for (const c of comparisons) {
+        const scoreIcon = c.scoreDelta < -0.1 ? "🔻" : c.scoreDelta > 0.1 ? "🔺" : "▬";
+        const scoreStr = `${scoreIcon} ${c.scoreDelta >= 0 ? "+" : ""}${c.scoreDelta.toFixed(2)}`;
+        
+        let corrStr = "—";
+        if (c.correlationDelta !== undefined) {
+          const corrIcon = c.correlationDelta < -0.01 ? "🔻" : c.correlationDelta > 0.01 ? "🔺" : "▬";
+          corrStr = `${corrIcon} ${c.correlationDelta >= 0 ? "+" : ""}${c.correlationDelta.toFixed(3)}`;
+        }
+        
+        const costIcon = c.costDelta > 0.0001 ? "💸" : c.costDelta < -0.0001 ? "💚" : "▬";
+        const costStr = Math.abs(c.costDelta) > 0.00001
+          ? `${costIcon} ${c.costDelta >= 0 ? "+" : ""}${c.costDelta.toFixed(4)}`
+          : "▬ $0.0000";
+        
+        const failed = c.scoreDelta < -0.5 || (c.correlationDelta !== undefined && c.correlationDelta < -0.05);
+        const statusIcon = failed ? "❌" : "✅";
+        
+        lines.push(`| ${c.taskId} | ${scoreStr} | ${corrStr} | ${costStr} | ${statusIcon} |`);
+      }
+      lines.push("");
+      lines.push("<sub>Score Δ = current − baseline (weighted score). Correlation Δ = r_current − r_baseline. Cost Δ in USD.</sub>");
+      lines.push("");
+    }
+  }
+
+  if (result.tokenStats) {
+    const ts = result.tokenStats;
+    const totalReqs = ts.cacheHits + ts.cacheMisses;
+    const hitRate = totalReqs > 0 ? ((ts.cacheHits / totalReqs) * 100).toFixed(0) : "0";
+    lines.push(
+      `<sub>💰 Cost: ${ts.totalCostUsd.toFixed(4)} · 🔤 Tokens: ${ts.totalTokens.toLocaleString()} · ⚡ Cache: ${ts.cacheHits}/${totalReqs} (${hitRate}%)</sub>`
+    );
+    lines.push("");
+  }
+
+  lines.push(`<sub>Generated by <a href="https://github.com/olusegunakinbo167-cell/Evaluators">ai-code-evaluator</a> — ${new Date().toISOString()}</sub>`);
+  return lines.join("\n");
+}

@@ -25,6 +25,7 @@ import {
 import { scanForSecurityIssues } from "./securityScanner";
 import { judgeResponses, extractJudgeScores, aggregateTelemetry, JudgeOptions } from "./llm/judge";
 import { JudgeProvider } from "./llm/judgeProvider";
+import { generateMutations, assessRobustness, type MutationKind, type RobustnessReport } from "./mutator";
 
 /**
  * Core synchronous evaluation — rubric scores must be provided.
@@ -104,11 +105,18 @@ export function evaluate(
  * Set input.autoJudge = false to explicitly disable auto-scoring.
  * Set LLM_DISABLE_CACHE=true to force clean runs.
  */
+export interface EvaluateAutoOptions extends JudgeOptions {
+  /** Number of synthetic mutations to test (0 = disabled). */
+  mutate?: number;
+  /** Mutation kinds to include. */
+  mutateKinds?: MutationKind[];
+}
+
 export async function evaluateAuto(
   input: EvaluationInput,
   provider?: JudgeProvider,
   judgeConfig?: JudgeProviderConfig,
-  judgeOptions?: JudgeOptions
+  judgeOptions?: EvaluateAutoOptions
 ): Promise<EvaluationResult> {
   const rubric = input.rubric ?? RUBRIC_DIMENSIONS;
   const autoJudgeEnabled =
@@ -133,7 +141,7 @@ export async function evaluateAuto(
     telemetry = aggregateTelemetry(judgeResults);
   }
 
-  return evaluate(
+  const result = evaluate(
     {
       ...input,
       manualScores: scoresMap,
@@ -142,6 +150,73 @@ export async function evaluateAuto(
     },
     telemetry
   );
+
+  // Mutation robustness testing
+  const mutateCount = judgeOptions?.mutate ?? 0;
+  if (mutateCount > 0 && autoJudgeEnabled) {
+    try {
+      const mutations = generateMutations(
+        input.responses,
+        mutateCount,
+        judgeOptions?.mutateKinds
+      );
+
+      if (mutations.length > 0) {
+        // Score all mutated responses
+        const mutatedResponses = mutations.map(m => m.mutatedResponse);
+        const mutJudgeResults = await judgeResponses(
+          input.prompt,
+          mutatedResponses,
+          provider,
+          judgeConfig,
+          judgeOptions,
+          rubric
+        );
+
+        // Build score maps
+        const originalScoreMap: Record<string, import("../types").RubricScores> = {};
+        for (const r of result.rankings) {
+          originalScoreMap[r.responseId] = r.scores;
+        }
+
+        const mutatedScoreMap: Record<string, import("../types").RubricScores> = {};
+        for (const [id, jr] of Object.entries(mutJudgeResults)) {
+          mutatedScoreMap[id] = jr.scores;
+        }
+
+        // Assess robustness
+        const robustnessReport = assessRobustness(
+          originalScoreMap,
+          mutatedScoreMap,
+          mutations
+        );
+
+        result.robustnessReport = robustnessReport;
+
+        // Merge mutation telemetry
+        const mutTelemetry = aggregateTelemetry(mutJudgeResults);
+        if (telemetry) {
+          telemetry.totalPromptTokens += mutTelemetry.totalPromptTokens;
+          telemetry.totalCompletionTokens += mutTelemetry.totalCompletionTokens;
+          telemetry.totalTokens += mutTelemetry.totalTokens;
+          telemetry.cacheHits += mutTelemetry.cacheHits;
+          telemetry.cacheMisses += mutTelemetry.cacheMisses;
+          telemetry.totalLatencyMs += mutTelemetry.totalLatencyMs;
+          telemetry.estimatedCostUsd = Math.round(
+            (telemetry.estimatedCostUsd + mutTelemetry.estimatedCostUsd) * 1_000_000
+          ) / 1_000_000;
+          telemetry.estimatedSavingsUsd = Math.round(
+            (telemetry.estimatedSavingsUsd + mutTelemetry.estimatedSavingsUsd) * 1_000_000
+          ) / 1_000_000;
+          result.telemetry = telemetry;
+        }
+      }
+    } catch (e) {
+      // Mutation testing failed — don't fail the evaluation, just skip robustness report
+    }
+  }
+
+  return result;
 }
 
 /** Validate a complete RubricScores object against the live rubric schema. */
