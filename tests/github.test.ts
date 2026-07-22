@@ -132,7 +132,7 @@ describe("appendStepSummary", () => {
 
   afterEach(() => {
     process.env = { ...OLD_ENV };
-    try { fs.unlinkSync(tmpFile); } catch {}
+    try { fs.unlinkSync(tmpFile); } catch { /* ignore */}
   });
 
   it("appends markdown to $GITHUB_STEP_SUMMARY when in GH Actions", () => {

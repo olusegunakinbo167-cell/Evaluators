@@ -195,7 +195,7 @@ describe("CLI exit codes (integration)", () => {
         stderr: err.stderr?.toString() ?? "",
       };
     } finally {
-      try { fs.unlinkSync(tmp); } catch {}
+      try { fs.unlinkSync(tmp); } catch { /* ignore */}
     }
   }
 

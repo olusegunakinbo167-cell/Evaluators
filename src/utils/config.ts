@@ -1,4 +1,3 @@
-// src/utils/config.ts
 /**
  * Evaluator config file loader with glob support.
  */
@@ -10,7 +9,6 @@ import {
   EvaluatorSuiteConfig,
   RubricDimension,
   validateRubric,
-  RUBRIC_DIMENSIONS,
 } from "../types";
 
 export interface ResolvedSuiteConfig extends Omit<EvaluatorSuiteConfig, "inputs" | "rubric"> {
@@ -74,7 +72,7 @@ function expandGlob(pattern: string, cwd: string): string[] {
   const re = globToRegExp(absPattern);
 
   return allFiles.filter(f => re.test(f));
-  }
+}
 
 export function expandInputs(
   inputs: string | string[],
@@ -156,13 +154,15 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
       minScore: suite.minScore,
       maxRegression: suite.maxRegression,
       baseline: suite.baseline ? path.resolve(configDir, suite.baseline) : undefined,
+      samples: suite.samples,
+      maxVariance: suite.maxVariance,
     });
   }
 
   return {
     suites,
     outputDir: config.outputDir ?? "./output",
-    exportFormat: (config.exportFormat ?? "md") as any,
+    exportFormat: (config.exportFormat ?? "md") as "json" | "csv" | "md" | "markdown",
     failFast: config.failFast ?? false,
     maxConcurrency: config.maxConcurrency,
   };
@@ -178,6 +178,8 @@ export function applyCliOverrides(
     minScore?: number;
     maxRegression?: number;
     baseline?: string;
+    samples?: number;
+    maxVariance?: number;
   }
 ): ResolvedSuiteConfig {
   return {
@@ -185,5 +187,7 @@ export function applyCliOverrides(
     minScore: overrides.minScore ?? suite.minScore,
     maxRegression: overrides.maxRegression ?? suite.maxRegression,
     baseline: overrides.baseline ?? suite.baseline,
+    samples: overrides.samples ?? suite.samples,
+    maxVariance: overrides.maxVariance ?? suite.maxVariance,
   };
 }

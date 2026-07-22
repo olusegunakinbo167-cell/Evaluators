@@ -28,7 +28,7 @@ function mockResult(id: string, fallback = false, justification = "ok"): JudgeRe
 // Clear cache before test suite, and disable cache by default
 beforeAll(() => {
   process.env.LLM_DISABLE_CACHE = "true";
-  try { clearCache(); } catch {}
+  try { clearCache(); } catch { /* ignore */}
 });
 
 describe("backoffDelay", () => {

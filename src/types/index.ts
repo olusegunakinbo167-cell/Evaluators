@@ -181,6 +181,27 @@ export interface EvaluationTelemetry {
   estimatedSavingsUsd: number;
 }
 
+/** Per-response variance statistics from multi-pass sampling. */
+export interface ResponseVariance {
+  responseId: string;
+  samples: number;
+  mean: number;
+  min: number;
+  max: number;
+  stddev: number;
+  variance: number;
+  scores: number[];
+}
+
+/** Aggregated variance report for an evaluation run. */
+export interface VarianceReport {
+  samples: number;
+  responses: ResponseVariance[];
+  maxStddev: number;
+  meanStddev: number;
+  highVarianceResponses: string[];
+}
+
 export interface EvaluationResult {
   taskId: string;
   prompt: string;
@@ -192,6 +213,8 @@ export interface EvaluationResult {
   notes?: string;
   /** Execution telemetry (populated when LLM judge is used). */
   telemetry?: EvaluationTelemetry;
+  /** Variance statistics from multi-pass sampling (if enabled). */
+  varianceReport?: VarianceReport;
   /** Rubric used for this evaluation (if custom). */
   rubric?: RubricDimension[];
 }
@@ -278,6 +301,10 @@ export interface EvaluatorSuiteConfig {
   maxRegression?: number;
   /** Path to baseline EvaluationResult JSON for regression comparison. */
   baseline?: string;
+  /** Number of times to sample each response for variance analysis (default 1). */
+  samples?: number;
+  /** Maximum allowed standard deviation across samples — exceeding causes failure. */
+  maxVariance?: number;
 }
 
 export interface EvaluatorConfig {

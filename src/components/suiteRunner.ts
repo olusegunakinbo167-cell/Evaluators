@@ -6,8 +6,12 @@
 
 import * as fs from "fs";
 import {
+  Confidence,
   EvaluationInput,
   EvaluationResult,
+  EvaluationTelemetry,
+  ResponseVariance,
+  VarianceReport,
 } from "../types";
 import {
   evaluate,
@@ -18,7 +22,19 @@ import {
   ThresholdViolation,
   RegressionViolation,
 } from "./evaluator";
+
 import { ResolvedSuiteConfig } from "../utils/config";
+
+export interface VarianceOptions {
+  samples?: number;
+  maxVariance?: number;
+}
+
+export interface VarianceViolation {
+  responseId: string;
+  stddev: number;
+  maxAllowed: number;
+}
 
 export interface SuiteRunResult {
   suiteName: string;
@@ -26,6 +42,7 @@ export interface SuiteRunResult {
   result: EvaluationResult;
   thresholdViolations: ThresholdViolation[];
   regressionViolations: RegressionViolation[];
+  varianceViolations: VarianceViolation[];
   failed: boolean;
   error?: string;
 }
@@ -36,6 +53,13 @@ export interface SuiteAggregateResult {
   passed: number;
   failed: number;
   total: number;
+  /** Aggregated token / cost telemetry across all runs in this suite. */
+  tokenStats?: {
+    totalTokens: number;
+    totalCostUsd: number;
+    cacheHits: number;
+    cacheMisses: number;
+  };
 }
 
 export interface MultiSuiteResult {
@@ -44,6 +68,13 @@ export interface MultiSuiteResult {
   totalFailed: number;
   totalRuns: number;
   failed: boolean;
+  /** Global token / cost telemetry. */
+  tokenStats?: {
+    totalTokens: number;
+    totalCostUsd: number;
+    cacheHits: number;
+    cacheMisses: number;
+  };
 }
 
 export interface SuiteRunOptions {
@@ -51,6 +82,157 @@ export interface SuiteRunOptions {
   maxRegression?: number;
   baseline?: string;
   failFast?: boolean;
+  samples?: number;
+  maxVariance?: number;
+  disableCache?: boolean;
+}
+
+function sumTelemetry(results: EvaluationResult[]): EvaluationTelemetry {
+  const out: EvaluationTelemetry = {
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalTokens: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    totalLatencyMs: 0,
+    estimatedCostUsd: 0,
+    estimatedSavingsUsd: 0,
+  };
+  for (const r of results) {
+    const t = r.telemetry;
+    if (!t) continue;
+    out.totalPromptTokens += t.totalPromptTokens;
+    out.totalCompletionTokens += t.totalCompletionTokens;
+    out.totalTokens += t.totalTokens;
+    out.cacheHits += t.cacheHits;
+    out.cacheMisses += t.cacheMisses;
+    out.totalLatencyMs += t.totalLatencyMs;
+    out.estimatedCostUsd += t.estimatedCostUsd;
+    out.estimatedSavingsUsd += t.estimatedSavingsUsd;
+  }
+  out.estimatedCostUsd = Math.round(out.estimatedCostUsd * 1_000_000) / 1_000_000;
+  out.estimatedSavingsUsd = Math.round(out.estimatedSavingsUsd * 1_000_000) / 1_000_000;
+  return out;
+}
+
+function computeVarianceStats(
+  samples: EvaluationResult[]
+): VarianceReport {
+  const scoresByResponse = new Map<string, number[]>();
+
+  for (const sample of samples) {
+    for (const ranked of sample.rankings) {
+      const arr = scoresByResponse.get(ranked.responseId) ?? [];
+      arr.push(ranked.weightedScore);
+      scoresByResponse.set(ranked.responseId, arr);
+    }
+  }
+
+  const responses: ResponseVariance[] = [];
+  for (const [responseId, scores] of scoresByResponse.entries()) {
+    const n = scores.length;
+    const mean = scores.reduce((a, b) => a + b, 0) / n;
+    const min = Math.min(...scores);
+    const max = Math.max(...scores);
+    const variance = scores.reduce((acc, s) => acc + (s - mean) * (s - mean), 0) / n;
+    const stddev = Math.sqrt(variance);
+    responses.push({
+      responseId,
+      samples: n,
+      mean: parseFloat(mean.toFixed(4)),
+      min: parseFloat(min.toFixed(4)),
+      max: parseFloat(max.toFixed(4)),
+      stddev: parseFloat(stddev.toFixed(4)),
+      variance: parseFloat(variance.toFixed(4)),
+      scores: scores.map(s => parseFloat(s.toFixed(4))),
+    });
+  }
+
+  const stddevs = responses.map(r => r.stddev);
+  const maxStddev = stddevs.length ? Math.max(...stddevs) : 0;
+  const meanStddev = stddevs.length
+    ? stddevs.reduce((a, b) => a + b, 0) / stddevs.length
+    : 0;
+
+  return {
+    samples: samples.length,
+    responses,
+    maxStddev: parseFloat(maxStddev.toFixed(4)),
+    meanStddev: parseFloat(meanStddev.toFixed(4)),
+    highVarianceResponses: [],
+  };
+}
+
+/**
+ * Run a single evaluation input with optional multi-pass variance sampling.
+ * When samples > 1, runs evaluateAuto N times, aggregates scores,
+ * computes variance statistics, and sums token/cost telemetry.
+ */
+async function runWithVariance(
+  input: EvaluationInput,
+  samples: number,
+  disableCache: boolean
+): Promise<{ result: EvaluationResult; allResults: EvaluationResult[] }> {
+  if (samples <= 1) {
+    const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
+    const result = hasScores
+      ? evaluate(input)
+      : await evaluateAuto(input, undefined, undefined, { disableCache });
+    return { result, allResults: [result] };
+  }
+
+  const allResults: EvaluationResult[] = [];
+  for (let i = 0; i < samples; i++) {
+    const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
+    const r = hasScores
+      ? evaluate(input)
+      : await evaluateAuto(input, undefined, undefined, { disableCache: true });
+    allResults.push(r);
+  }
+
+  const varianceReport = computeVarianceStats(allResults);
+
+  // Average the rankings for the primary result
+  const baseResult = allResults[0];
+  const meanScores = new Map(
+    varianceReport.responses.map(v => [v.responseId, v.mean] as const)
+  );
+
+  const averagedRankings = baseResult.rankings.map(rr => ({
+    ...rr,
+    weightedScore: meanScores.get(rr.responseId) ?? rr.weightedScore,
+  })).sort((a, b) => b.weightedScore - a.weightedScore)
+    .map((r, i) => ({ ...r, rank: i + 1 }));
+
+  const telemetry = sumTelemetry(allResults);
+
+  const result: EvaluationResult = {
+    ...baseResult,
+    rankings: averagedRankings,
+    preferred: averagedRankings[0]?.responseId ?? baseResult.preferred,
+    telemetry,
+    varianceReport,
+  };
+
+  return { result, allResults };
+}
+
+function checkVariance(
+  varianceReport: VarianceReport | undefined,
+  maxVariance: number | undefined
+): VarianceViolation[] {
+  if (!varianceReport || maxVariance === undefined) return [];
+  const violations: VarianceViolation[] = [];
+  for (const r of varianceReport.responses) {
+    if (r.stddev > maxVariance) {
+      violations.push({
+        responseId: r.responseId,
+        stddev: r.stddev,
+        maxAllowed: maxVariance,
+      });
+    }
+  }
+  return violations;
 }
 
 async function runSingleInput(
@@ -63,16 +245,18 @@ async function runSingleInput(
     const raw = fs.readFileSync(inputFile, "utf-8");
     const input = JSON.parse(raw) as EvaluationInput;
 
-    // Inject suite rubric if provided
     if (rubric) {
       input.rubric = rubric;
     }
 
-    const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
-    const result = hasScores ? evaluate(input) : await evaluateAuto(input);
+    const samples = Math.max(1, Math.floor(opts.samples ?? 1));
+    const disableCache = opts.disableCache ?? samples > 1;
+
+    const { result } = await runWithVariance(input, samples, disableCache);
 
     let thresholdViolations: ThresholdViolation[] = [];
     let regressionViolations: RegressionViolation[] = [];
+    let varianceViolations: VarianceViolation[] = [];
     let failed = false;
 
     if (opts.minScore !== undefined) {
@@ -86,16 +270,26 @@ async function runSingleInput(
         const maxReg = opts.maxRegression ?? 0;
         regressionViolations = checkRegression(result, baseline, maxReg);
         if (regressionViolations.length > 0) failed = true;
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
         return {
           suiteName,
           inputFile,
           result,
           thresholdViolations: [],
           regressionViolations: [],
+          varianceViolations: [],
           failed: true,
-          error: `Baseline load failed: ${e?.message ?? e}`,
+          error: `Baseline load failed: ${msg}`,
         };
+      }
+    }
+
+    if (opts.maxVariance !== undefined && result.varianceReport) {
+      varianceViolations = checkVariance(result.varianceReport, opts.maxVariance);
+      if (varianceViolations.length > 0) {
+        failed = true;
+        result.varianceReport.highVarianceResponses = varianceViolations.map(v => v.responseId);
       }
     }
 
@@ -105,10 +299,11 @@ async function runSingleInput(
       result,
       thresholdViolations,
       regressionViolations,
+      varianceViolations,
       failed,
     };
-  } catch (err: any) {
-    // Synthesize a minimal failed result
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
     return {
       suiteName,
       inputFile,
@@ -119,12 +314,13 @@ async function runSingleInput(
         timestamp: new Date().toISOString(),
         rankings: [],
         preferred: "",
-        confidence: "low" as any,
+        confidence: Confidence.LOW,
       },
       thresholdViolations: [],
       regressionViolations: [],
+      varianceViolations: [],
       failed: true,
-      error: err?.message ?? String(err),
+      error: msg,
     };
   }
 }
@@ -138,6 +334,9 @@ async function runSuite(
     maxRegression: cliOverrides.maxRegression ?? suite.maxRegression,
     baseline: cliOverrides.baseline ?? suite.baseline,
     failFast: cliOverrides.failFast,
+    samples: cliOverrides.samples ?? suite.samples,
+    maxVariance: cliOverrides.maxVariance ?? suite.maxVariance,
+    disableCache: cliOverrides.disableCache,
   };
 
   const runs: SuiteRunResult[] = [];
@@ -152,12 +351,32 @@ async function runSuite(
     }
   }
 
+  // Aggregate token stats
+  let totalTokens = 0;
+  let totalCostUsd = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  for (const run of runs) {
+    const t = run.result.telemetry;
+    if (!t) continue;
+    totalTokens += t.totalTokens;
+    totalCostUsd += t.estimatedCostUsd;
+    cacheHits += t.cacheHits;
+    cacheMisses += t.cacheMisses;
+  }
+
   return {
     suiteName: suite.name,
     runs,
     passed: runs.length - failedCount,
     failed: failedCount,
     total: runs.length,
+    tokenStats: {
+      totalTokens,
+      totalCostUsd,
+      cacheHits,
+      cacheMisses,
+    },
   };
 }
 
@@ -171,18 +390,18 @@ export async function runSuites(
   maxConcurrency?: number
 ): Promise<MultiSuiteResult> {
   const concurrency = maxConcurrency && maxConcurrency > 0 ? maxConcurrency : suites.length;
-  const aggregates: SuiteAggregateResult[] = [];
+  const aggregates: SuiteAggregateResult[] = new Array(suites.length);
 
   // Simple concurrency-limited execution
   let idx = 0;
-  async function worker() {
+  async function worker(): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
     while (true) {
       const i = idx++;
       if (i >= suites.length) break;
       const agg = await runSuite(suites[i], cliOverrides);
       aggregates[i] = agg;
       if (cliOverrides.failFast && agg.failed > 0) {
-        // Mark remaining suites as skipped
         idx = suites.length;
         break;
       }
@@ -194,16 +413,36 @@ export async function runSuites(
     .map(() => worker());
   await Promise.all(workers);
 
-  const totalPassed = aggregates.reduce((s, a) => s + a.passed, 0);
-  const totalFailed = aggregates.reduce((s, a) => s + a.failed, 0);
-  const totalRuns = aggregates.reduce((s, a) => s + a.total, 0);
+  const filtered = aggregates.filter(Boolean);
+  const totalPassed = filtered.reduce((s, a) => s + a.passed, 0);
+  const totalFailed = filtered.reduce((s, a) => s + a.failed, 0);
+  const totalRuns = filtered.reduce((s, a) => s + a.total, 0);
+
+  // Global token stats
+  let totalTokens = 0;
+  let totalCostUsd = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  for (const agg of filtered) {
+    if (!agg.tokenStats) continue;
+    totalTokens += agg.tokenStats.totalTokens;
+    totalCostUsd += agg.tokenStats.totalCostUsd;
+    cacheHits += agg.tokenStats.cacheHits;
+    cacheMisses += agg.tokenStats.cacheMisses;
+  }
 
   return {
-    aggregates: aggregates.filter(Boolean),
+    aggregates: filtered,
     totalPassed,
     totalFailed,
     totalRuns,
     failed: totalFailed > 0,
+    tokenStats: {
+      totalTokens,
+      totalCostUsd,
+      cacheHits,
+      cacheMisses,
+    },
   };
 }
 
@@ -268,6 +507,14 @@ export function buildAggregatedMarkdown(result: MultiSuiteResult): string {
         lines.push("");
       }
 
+      if (run.varianceViolations.length > 0) {
+        lines.push("**Variance violations:**");
+        for (const v of run.varianceViolations) {
+          lines.push(`- \`${v.responseId}\`: stddev ${v.stddev} > max ${v.maxAllowed}`);
+        }
+        lines.push("");
+      }
+
       // Quick score table
       if (run.result.rankings.length > 0) {
         lines.push("| Response | Score | Correctness | Security |");
@@ -280,24 +527,23 @@ export function buildAggregatedMarkdown(result: MultiSuiteResult): string {
     }
   }
 
-  // Aggregate telemetry
-  let totalTokens = 0, cacheHits = 0, cacheMisses = 0, totalCost = 0;
-  for (const agg of result.aggregates) {
-    for (const run of agg.runs) {
-      const t = run.result.telemetry;
-      if (!t) continue;
-      totalTokens += t.totalTokens;
-      cacheHits += t.cacheHits;
-      cacheMisses += t.cacheMisses;
-      totalCost += t.estimatedCostUsd;
-    }
-  }
-  if (totalTokens > 0 || cacheHits + cacheMisses > 0) {
+  // Token / cost summary
+  const ts = result.tokenStats;
+  if (ts && (ts.totalTokens > 0 || ts.cacheHits + ts.cacheMisses > 0)) {
     lines.push("---");
     lines.push("");
-    lines.push(`<sub>Aggregate telemetry — Tokens: ${totalTokens.toLocaleString()} | Cache: ${cacheHits}/${cacheHits + cacheMisses} | Cost: $${totalCost.toFixed(4)}</sub>`);
+    lines.push("## Token / Cost Summary");
+    lines.push("");
+    lines.push("| Metric | Value |");
+    lines.push("|--------|-------|");
+    lines.push(`| Total tokens | ${ts.totalTokens.toLocaleString()} |`);
+    lines.push(`| Cache hits | ${ts.cacheHits} |`);
+    lines.push(`| Cache misses | ${ts.cacheMisses} |`);
+    lines.push(`| Estimated cost | $${ts.totalCostUsd.toFixed(4)} |`);
     lines.push("");
   }
 
   return lines.join("\n");
 }
+
+export { computeVarianceStats, checkVariance };

@@ -14,6 +14,7 @@ import {
   type ThresholdViolation,
   type RegressionViolation,
 } from "./components/evaluator";
+import { checkVariance, type VarianceViolation } from "./components/suiteRunner";
 import { exportResult, exportToJSON, exportToCSV, exportToMarkdown, writeGitHubStepSummary } from "./utils/exporter";
 import {
   isGitHubActions,
@@ -26,6 +27,7 @@ import {
 import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
 import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
 import { EvaluationInput, Confidence, EvaluationResult } from "./types";
+import { emitVarianceAnnotations, emitVarianceAnnotationsForResult, buildCiSummaryMarkdown } from "./utils/ciReporter";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
 import { getCacheStats } from "./components/llm/judge";
 
@@ -41,6 +43,13 @@ function getArgFloat(args: string[], flag: string): number | undefined {
   const v = getArg(args, flag);
   if (v === undefined) return undefined;
   const n = parseFloat(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function getArgInt(args: string[], flag: string): number | undefined {
+  const v = getArg(args, flag);
+  if (v === undefined) return undefined;
+  const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : undefined;
 }
 
@@ -163,12 +172,63 @@ async function runDemo() {
 async function runSingleEval(
   inputPath: string,
   args: string[]
-): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[] }> {
+): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[]; varianceViolations: VarianceViolation[] }> {
   const raw = fs.readFileSync(inputPath, "utf-8");
   const input: EvaluationInput = JSON.parse(raw);
 
+  const samples = Math.max(1, getArgInt(args, "--samples") ?? 1);
+  const maxVariance = getArgFloat(args, "--max-variance");
+
   const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
-  const result = hasScores ? evaluate(input) : await evaluateAuto(input);
+
+  let result: EvaluationResult;
+  if (samples > 1 && !hasScores) {
+    // Multi-pass variance sampling
+    const { computeVarianceStats } = await import("./components/suiteRunner.js");
+    const allResults: EvaluationResult[] = [];
+    for (let i = 0; i < samples; i++) {
+      const r = await evaluateAuto(input, undefined, undefined, { disableCache: true });
+      allResults.push(r);
+    }
+    const varianceReport = computeVarianceStats(allResults);
+    const baseResult = allResults[0];
+    const meanScores = new Map(varianceReport.responses.map(v => [v.responseId, v.mean] as const));
+    const averagedRankings = baseResult.rankings.map(rr => ({
+      ...rr,
+      weightedScore: meanScores.get(rr.responseId) ?? rr.weightedScore,
+    })).sort((a, b) => b.weightedScore - a.weightedScore)
+      .map((r, i) => ({ ...r, rank: i + 1 }));
+
+    let totalPromptTokens = 0, totalCompletionTokens = 0, totalTokens = 0;
+    let cacheHits = 0, cacheMisses = 0, totalLatencyMs = 0;
+    let estimatedCostUsd = 0, estimatedSavingsUsd = 0;
+    for (const r of allResults) {
+      const t = r.telemetry;
+      if (!t) continue;
+      totalPromptTokens += t.totalPromptTokens;
+      totalCompletionTokens += t.totalCompletionTokens;
+      totalTokens += t.totalTokens;
+      cacheHits += t.cacheHits;
+      cacheMisses += t.cacheMisses;
+      totalLatencyMs += t.totalLatencyMs;
+      estimatedCostUsd += t.estimatedCostUsd;
+      estimatedSavingsUsd += t.estimatedSavingsUsd;
+    }
+    result = {
+      ...baseResult,
+      rankings: averagedRankings,
+      preferred: averagedRankings[0]?.responseId ?? baseResult.preferred,
+      telemetry: {
+        totalPromptTokens, totalCompletionTokens, totalTokens,
+        cacheHits, cacheMisses, totalLatencyMs,
+        estimatedCostUsd: Math.round(estimatedCostUsd * 1_000_000) / 1_000_000,
+        estimatedSavingsUsd: Math.round(estimatedSavingsUsd * 1_000_000) / 1_000_000,
+      },
+      varianceReport,
+    };
+  } else {
+    result = hasScores ? evaluate(input) : await evaluateAuto(input);
+  }
 
   console.log(JSON.stringify(result, null, 2));
 
@@ -183,6 +243,7 @@ async function runSingleEval(
   let failed = false;
   let thresholdViolations: ThresholdViolation[] = [];
   let regressionViolations: RegressionViolation[] = [];
+  let varianceViolations: VarianceViolation[] = [];
 
   const minScore = getArgFloat(args, "--min-score");
   if (minScore !== undefined) {
@@ -209,13 +270,30 @@ async function runSingleEval(
           emitRegressionAnnotations(regressionViolations, inputPath);
         }
       }
-    } catch (err: any) {
-      console.error(`\n❌ Failed to load baseline from ${baselinePath}: ${err?.message ?? err}\n`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`\n❌ Failed to load baseline from ${baselinePath}: ${msg}\n`);
       process.exit(1);
     }
   }
 
-  return { result, failed, thresholdViolations, regressionViolations };
+  // Variance check
+  if (maxVariance !== undefined && result.varianceReport) {
+    varianceViolations = checkVariance(result.varianceReport, maxVariance);
+    if (varianceViolations.length > 0) {
+      failed = true;
+      console.error("\n❌ VARIANCE CHECK FAILED\n");
+      for (const v of varianceViolations) {
+        console.error(`  ${v.responseId}: stddev=${v.stddev} > max=${v.maxAllowed}`);
+      }
+      console.error("");
+      if (isGitHubActions()) {
+        emitVarianceAnnotations(varianceViolations, inputPath);
+      }
+    }
+  }
+
+  return { result, failed, thresholdViolations, regressionViolations, varianceViolations };
 }
 
 // ─── Config / multi-suite CLI mode ───────────────────────────────────────────
@@ -237,6 +315,8 @@ async function runConfigMode(args: string[]): Promise<boolean> {
     minScore: getArgFloat(args, "--min-score"),
     maxRegression: getArgFloat(args, "--max-regression"),
     baseline: getArg(args, "--baseline"),
+    samples: getArgInt(args, "--samples"),
+    maxVariance: getArgFloat(args, "--max-variance"),
   };
 
   // Apply CLI overrides to each suite
@@ -259,18 +339,25 @@ async function runConfigMode(args: string[]): Promise<boolean> {
 
   // Build unified Markdown report
   const aggregatedMarkdown = buildAggregatedMarkdown(multiResult);
+  const ciExtraMarkdown = buildCiSummaryMarkdown(multiResult);
+  const fullMarkdown = ciExtraMarkdown ? aggregatedMarkdown + "\n\n" + ciExtraMarkdown : aggregatedMarkdown;
+
+  // Emit variance annotations in CI
+  if (isGitHubActions()) {
+    emitVarianceAnnotationsForResult(multiResult);
+  }
 
   // Export unified report
   if (!fs.existsSync(config.outputDir)) {
     fs.mkdirSync(config.outputDir, { recursive: true });
   }
   const reportPath = path.join(config.outputDir, `suite-report-${Date.now()}.md`);
-  fs.writeFileSync(reportPath, aggregatedMarkdown, "utf-8");
+  fs.writeFileSync(reportPath, fullMarkdown, "utf-8");
   console.log(`✅ Aggregated report: ${reportPath}\n`);
 
   // GitHub Actions step summary
   if (isGitHubActions()) {
-    const wrote = appendStepSummary(aggregatedMarkdown);
+    const wrote = appendStepSummary(fullMarkdown);
     if (wrote) console.error("📝 Wrote aggregated summary to $GITHUB_STEP_SUMMARY");
   }
 
@@ -329,13 +416,13 @@ async function runCli() {
   if (!inputPath) {
     console.error(
       "Usage:\n" +
-      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--gh-pr-comment]\n" +
-      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--gh-pr-comment]"
+      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]"
     );
     process.exit(1);
   }
 
-  const { result, failed, thresholdViolations, regressionViolations } = await runSingleEval(inputPath, args);
+  const { result, failed, thresholdViolations, regressionViolations, varianceViolations } = await runSingleEval(inputPath, args);
 
   // GitHub Actions step summary
   if (isGitHubActions()) {

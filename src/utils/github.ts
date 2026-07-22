@@ -133,7 +133,7 @@ function getPrNumber(): number | undefined {
         event?.pull_request?.number ??
         event?.number;
       if (typeof pr === "number") return pr;
-    } catch {}
+    } catch { /* ignore */}
   }
 
   return undefined;
