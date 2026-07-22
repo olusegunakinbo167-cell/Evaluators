@@ -256,6 +256,9 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
       llm,
       groundTruth,
       minCorrelation,
+      mutate: suite.mutate ?? config.mutate,
+      minRobustness: suite.minRobustness ?? config.minRobustness,
+      mutateKinds: suite.mutateKinds ?? config.mutateKinds,
     });
   }
 
@@ -284,6 +287,9 @@ export function applyCliOverrides(
     llm?: LlmEndpointConfig;
     groundTruth?: string;
     minCorrelation?: number;
+    mutate?: number;
+    minRobustness?: number;
+    mutateKinds?: import("../types").MutationKind[];
   }
 ): ResolvedSuiteConfig {
   return {
@@ -296,5 +302,8 @@ export function applyCliOverrides(
     llm: mergeLlmConfig(suite.llm, overrides.llm),
     groundTruth: overrides.groundTruth ?? suite.groundTruth,
     minCorrelation: overrides.minCorrelation ?? suite.minCorrelation,
+    mutate: overrides.mutate ?? suite.mutate,
+    minRobustness: overrides.minRobustness ?? suite.minRobustness,
+    mutateKinds: overrides.mutateKinds ?? suite.mutateKinds,
   };
 }

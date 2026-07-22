@@ -3,8 +3,7 @@
  * and judge calibration reporting.
  */
 
-import { SuiteRunResult, VarianceViolation, MultiSuiteResult, CalibrationViolation } from "../components/suiteRunner";
-import { CalibrationReport } from "../types";
+import { SuiteRunResult, VarianceViolation, MultiSuiteResult, CalibrationViolation, RobustnessViolation } from "../components/suiteRunner";
 
 /**
  * Emit GitHub Actions ::error:: annotations for high-variance responses.
@@ -69,6 +68,40 @@ export function emitCalibrationAnnotationsForResult(result: MultiSuiteResult): n
       if (run.calibrationViolations.length > 0) {
         emitCalibrationAnnotations(run.calibrationViolations, run.inputFile);
         count += run.calibrationViolations.length;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Emit GitHub Actions ::error:: annotations for robustness failures.
+ */
+export function emitRobustnessAnnotations(
+  violations: RobustnessViolation[],
+  inputFile: string
+): void {
+  for (const v of violations) {
+    const safeFile = inputFile.replace(/[\r\n]/g, " ");
+    console.error(
+      `::error file=${safeFile},title=Judge robustness failed::` +
+      `Task ${v.taskId} robustness score ${v.robustnessScore.toFixed(2)}/10 ` +
+      `below threshold ${v.minRobustness} (detection rate ${(v.detectionRate * 100).toFixed(1)}%)`
+    );
+  }
+}
+
+/**
+ * Emit robustness annotations for all failed runs in a MultiSuiteResult.
+ * Returns the number of annotations emitted.
+ */
+export function emitRobustnessAnnotationsForResult(result: MultiSuiteResult): number {
+  let count = 0;
+  for (const agg of result.aggregates) {
+    for (const run of agg.runs) {
+      if (run.robustnessViolations.length > 0) {
+        emitRobustnessAnnotations(run.robustnessViolations, run.inputFile);
+        count += run.robustnessViolations.length;
       }
     }
   }
@@ -214,6 +247,76 @@ export function renderCalibrationSummary(runs: SuiteRunResult[]): string {
 }
 
 /**
+ * Render judge robustness / mutation testing summary as Markdown.
+ * Includes detection rate, robustness score, and undetected mutations table.
+ */
+export function renderRobustnessSummary(runs: SuiteRunResult[]): string {
+  const withRobustness = runs.filter(r => r.result.robustnessReport);
+  if (withRobustness.length === 0) return "";
+
+  const lines: string[] = [];
+
+  lines.push("## Judge Robustness Report (Mutation Testing)");
+  lines.push("");
+
+  // Summary table per task
+  lines.push("| Task | Robustness | Detection Rate | Mutations | Detected | Status |");
+  lines.push("|------|------------|----------------|-----------|----------|--------|");
+
+  for (const run of withRobustness) {
+    const rr = run.result.robustnessReport!;
+    const failed = run.robustnessViolations.length > 0;
+    const icon = failed ? "❌" : "✅";
+    lines.push(
+      `| ${run.result.taskId} | ${rr.robustnessScore.toFixed(2)}/10 | ${(rr.detectionRate * 100).toFixed(1)}% | ${rr.totalMutations} | ${rr.detectedMutations} | ${icon} |`
+    );
+  }
+  lines.push("");
+
+  // Per-kind breakdown
+  lines.push("### Detection Rate by Mutation Kind");
+  lines.push("");
+  lines.push("| Task | Kind | Detected | Total | Rate |");
+  lines.push("|------|------|----------|-------|------|");
+
+  for (const run of withRobustness) {
+    const rr = run.result.robustnessReport!;
+    for (const [kind, stats] of Object.entries(rr.byKind)) {
+      if (stats.total === 0) continue;
+      lines.push(
+        `| ${run.result.taskId} | ${kind} | ${stats.detected} | ${stats.total} | ${(stats.detectionRate * 100).toFixed(1)}% |`
+      );
+    }
+  }
+  lines.push("");
+
+  // Undetected mutations table
+  const allUndetected = withRobustness.flatMap(run =>
+    (run.result.robustnessReport?.undetected ?? []).map(u => ({ ...u, taskId: run.result.taskId }))
+  );
+
+  if (allUndetected.length > 0) {
+    lines.push("### ⚠️ Undetected Mutations");
+    lines.push("");
+    lines.push("| Task | Mutation | Kind | Original | Mutated | Drop |");
+    lines.push("|------|----------|------|----------|---------|------|");
+
+    // Sort by score drop ascending (worst misses first), limit to 30
+    const sorted = allUndetected.sort((a, b) => a.scoreDrop - b.scoreDrop).slice(0, 30);
+    for (const u of sorted) {
+      lines.push(
+        `| ${u.taskId} | ${u.mutationId} | ${u.kind} | ${u.originalScore} | ${u.mutatedScore} | ${u.scoreDrop.toFixed(2)} |`
+      );
+    }
+    lines.push("");
+    lines.push(`_Showing ${sorted.length} of ${allUndetected.length} undetected mutations_`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
  * Build a complete CI Markdown summary including token/cost stats,
  * variance information, and calibration results.
  */
@@ -223,6 +326,9 @@ export function buildCiSummaryMarkdown(result: MultiSuiteResult): string {
   if (tokenMd) parts.push(tokenMd);
 
   const allRuns = result.aggregates.flatMap(a => a.runs);
+
+  const robustnessMd = renderRobustnessSummary(allRuns);
+  if (robustnessMd) parts.push(robustnessMd);
 
   const calibrationMd = renderCalibrationSummary(allRuns);
   if (calibrationMd) parts.push(calibrationMd);

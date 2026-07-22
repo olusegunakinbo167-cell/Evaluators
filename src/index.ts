@@ -22,11 +22,12 @@ import {
   emitRegressionAnnotations,
   postPrComment,
   buildPrCommentBody,
+  buildMultiSuitePrCommentBody,
   appendStepSummary,
 } from "./utils/github";
 import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
 import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
-import { EvaluationInput, Confidence, EvaluationResult, LlmEndpointConfig } from "./types";
+import { EvaluationInput, Confidence, EvaluationResult, LlmEndpointConfig, MutationKind } from "./types";
 import { emitVarianceAnnotations, emitVarianceAnnotationsForResult, emitCalibrationAnnotations, buildCiSummaryMarkdown } from "./utils/ciReporter";
 import {
   calibrateJudge,
@@ -62,6 +63,18 @@ function getArgInt(args: string[], flag: string): number | undefined {
 
 function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
+}
+
+function getPrCommentOptions(args: string[]): { prNumber?: number; token?: string } {
+  const prArg = getArg(args, "--github-pr");
+  const tokenArg = getArg(args, "--github-token");
+  const out: { prNumber?: number; token?: string } = {};
+  if (prArg) {
+    const n = parseInt(prArg, 10);
+    if (Number.isFinite(n)) out.prNumber = n;
+  }
+  if (tokenArg) out.token = tokenArg;
+  return out;
 }
 
 function parseLlmCliArgs(args: string[]): LlmEndpointConfig | undefined {
@@ -225,7 +238,7 @@ async function runDemo() {
 async function runSingleEval(
   inputPath: string,
   args: string[]
-): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[]; varianceViolations: VarianceViolation[]; calibrationViolations: CalibrationViolation[] }> {
+): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[]; varianceViolations: VarianceViolation[]; calibrationViolations: CalibrationViolation[]; robustnessViolations: import("./components/suiteRunner").RobustnessViolation[] }> {
   const raw = fs.readFileSync(inputPath, "utf-8");
   const input: EvaluationInput = JSON.parse(raw);
 
@@ -234,6 +247,13 @@ async function runSingleEval(
   const llmConfig = parseLlmCliArgs(args);
   const groundTruthPath = getArg(args, "--ground-truth");
   const minCorrelation = getArgFloat(args, "--min-correlation") ?? 0.75;
+  const mutateCount = getArgInt(args, "--mutate") ?? 0;
+  const minRobustness = getArgFloat(args, "--min-robustness") ?? 6.0;
+  // Parse --mutate-kinds "security,syntax,logic" (comma-separated)
+  const mutateKindsArg = getArg(args, "--mutate-kinds");
+  const mutateKinds = mutateKindsArg
+    ? mutateKindsArg.split(",").map(s => s.trim()).filter(Boolean) as MutationKind[]
+    : undefined;
 
   const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
 
@@ -243,7 +263,7 @@ async function runSingleEval(
     const { computeVarianceStats } = await import("./components/suiteRunner.js");
     const allResults: EvaluationResult[] = [];
     for (let i = 0; i < samples; i++) {
-      const r = await evaluateAuto(input, undefined, llmConfig, { disableCache: true });
+      const r = await evaluateAuto(input, undefined, llmConfig, { disableCache: true, mutate: mutateCount || undefined, mutateKinds });
       allResults.push(r);
     }
     const varianceReport = computeVarianceStats(allResults);
@@ -283,7 +303,7 @@ async function runSingleEval(
       varianceReport,
     };
   } else {
-    result = hasScores ? evaluate(input) : await evaluateAuto(input, undefined, llmConfig);
+    result = hasScores ? evaluate(input) : await evaluateAuto(input, undefined, llmConfig, { mutate: mutateCount || undefined, mutateKinds });
   }
 
   console.log(JSON.stringify(result, null, 2));
@@ -301,6 +321,7 @@ async function runSingleEval(
   let regressionViolations: RegressionViolation[] = [];
   let varianceViolations: VarianceViolation[] = [];
   let calibrationViolations: CalibrationViolation[] = [];
+  let robustnessViolations: import("./components/suiteRunner").RobustnessViolation[] = [];
 
   const minScore = getArgFloat(args, "--min-score");
   if (minScore !== undefined) {
@@ -384,7 +405,35 @@ async function runSingleEval(
     }
   }
 
-  return { result, failed, thresholdViolations, regressionViolations, varianceViolations, calibrationViolations };
+
+  // Robustness / mutation check
+  if (result.robustnessReport) {
+    if (result.robustnessReport.robustnessScore < minRobustness) {
+      failed = true;
+      console.error("\n❌ ROBUSTNESS CHECK FAILED\n");
+      console.error(`  Robustness score ${result.robustnessReport.robustnessScore}/10 < min ${minRobustness}`);
+      console.error(`  Detection rate: ${(result.robustnessReport.detectionRate * 100).toFixed(1)}%`);
+      console.error("");
+      robustnessViolations.push({
+        taskId: result.taskId,
+        robustnessScore: result.robustnessReport.robustnessScore,
+        minRobustness,
+        detectionRate: result.robustnessReport.detectionRate,
+      });
+      if (isGitHubActions()) {
+        const { emitRobustnessAnnotations } = await import("./utils/ciReporter.js");
+        emitRobustnessAnnotations(robustnessViolations, inputPath);
+      }
+    } else {
+      console.log(
+        `\n🛡️  Robustness: score=${result.robustnessReport.robustnessScore}/10, ` +
+        `detection=${(result.robustnessReport.detectionRate * 100).toFixed(1)}% ` +
+        `(${result.robustnessReport.detectedMutations}/${result.robustnessReport.totalMutations})\n`
+      );
+    }
+  }
+
+  return { result, failed, thresholdViolations, regressionViolations, varianceViolations, calibrationViolations, robustnessViolations };
 }
 
 // ─── Config / multi-suite CLI mode ───────────────────────────────────────────
@@ -402,6 +451,12 @@ async function runConfigMode(args: string[]): Promise<boolean> {
   console.error(`\n🔧 Loaded config with ${config.suites.length} suite(s)\n`);
 
   // CLI overrides apply to all suites
+  const mutateKindsArg = getArg(args, "--mutate-kinds");
+  const mutateKinds = mutateKindsArg
+    ? mutateKindsArg.split(",").map(s => s.trim()).filter(Boolean) as MutationKind[]
+    : undefined;
+
+  // CLI overrides apply to all suites
   const cliOverrides = {
     minScore: getArgFloat(args, "--min-score"),
     maxRegression: getArgFloat(args, "--max-regression"),
@@ -411,6 +466,9 @@ async function runConfigMode(args: string[]): Promise<boolean> {
     llm: parseLlmCliArgs(args),
     groundTruth: getArg(args, "--ground-truth"),
     minCorrelation: getArgFloat(args, "--min-correlation"),
+    mutate: getArgInt(args, "--mutate"),
+    minRobustness: getArgFloat(args, "--min-robustness"),
+    mutateKinds,
   };
 
   // Apply CLI overrides to each suite
@@ -436,11 +494,12 @@ async function runConfigMode(args: string[]): Promise<boolean> {
   const ciExtraMarkdown = buildCiSummaryMarkdown(multiResult);
   const fullMarkdown = ciExtraMarkdown ? aggregatedMarkdown + "\n\n" + ciExtraMarkdown : aggregatedMarkdown;
 
-  // Emit variance + calibration annotations in CI
+  // Emit variance + calibration + robustness annotations in CI
   if (isGitHubActions()) {
     emitVarianceAnnotationsForResult(multiResult);
-    const { emitCalibrationAnnotationsForResult } = await import("./utils/ciReporter.js");
+    const { emitCalibrationAnnotationsForResult, emitRobustnessAnnotationsForResult } = await import("./utils/ciReporter.js");
     emitCalibrationAnnotationsForResult(multiResult);
+    emitRobustnessAnnotationsForResult(multiResult);
   }
 
   // Export unified report
@@ -459,18 +518,11 @@ async function runConfigMode(args: string[]): Promise<boolean> {
 
   // PR comment — aggregate across all suites
   if (hasFlag(args, "--gh-pr-comment")) {
-    // Build a combined PR comment from all failed runs, or a success summary
-    const failedRuns = multiResult.aggregates.flatMap(a => a.runs.filter(r => r.failed));
-    let prBody = `## ${multiResult.failed ? "❌" : "✅"} Evaluation Suites — ${multiResult.totalPassed}/${multiResult.totalRuns} passed\n\n`;
-    prBody += "| Suite | Passed | Failed | Total |\n|-------|--------|--------|-------|\n";
-    for (const agg of multiResult.aggregates) {
-      prBody += `| ${agg.suiteName} | ${agg.passed} | ${agg.failed} | ${agg.total} |\n`;
-    }
-    prBody += "\n" + aggregatedMarkdown.split("\n").slice(0, 80).join("\n");
-    if (aggregatedMarkdown.length > 4000) prBody += "\n\n_…full report truncated, see CI artifacts_";
+    const prOpts = getPrCommentOptions(args);
+    const prBody = buildMultiSuitePrCommentBody(multiResult, { includeMutations: true });
 
     try {
-      const url = await postPrComment(prBody);
+      const url = await postPrComment(prBody, prOpts);
       if (url) console.error(`\n💬 Posted PR comment: ${url}`);
       else console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");
     } catch (err: any) {
@@ -512,10 +564,20 @@ async function runCli() {
   if (!inputPath) {
     console.error(
       "Usage:\n" +
-      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--samples <n> --max-variance <float>] [--ground-truth <path> --min-correlation <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --eval <input.json> [--export json|csv|md]\n" +
+      "    [--min-score <float>] [--baseline <path> --max-regression <float>]\n" +
+      "    [--samples <n> --max-variance <float>]\n" +
+      "    [--ground-truth <path> --min-correlation <float>]\n" +
+      "    [--mutate <n> --min-robustness <float> --mutate-kinds <kinds>]\n" +
+      "    [--gh-pr-comment] [--github-pr <number>] [--github-token <token>]\n" +
       "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
       "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]\n" +
-      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--ground-truth <path> --min-correlation <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --config <evaluators.config.json> [--export md]\n" +
+      "    [--min-score <float>] [--max-regression <float>]\n" +
+      "    [--samples <n> --max-variance <float>]\n" +
+      "    [--ground-truth <path> --min-correlation <float>]\n" +
+      "    [--mutate <n> --min-robustness <float> --mutate-kinds <kinds>]\n" +
+      "    [--gh-pr-comment] [--github-pr <number>] [--github-token <token>]\n" +
       "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
       "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]"
     );
@@ -536,9 +598,11 @@ async function runCli() {
 
   // PR comment
   if (hasFlag(args, "--gh-pr-comment")) {
+    const prOpts = getPrCommentOptions(args);
     try {
       const url = await postPrComment(
-        buildPrCommentBody(result, thresholdViolations, regressionViolations)
+        buildPrCommentBody(result, thresholdViolations, regressionViolations),
+        prOpts
       );
       if (url) console.error(`\n💬 Posted PR comment: ${url}`);
       else console.error("\n⚠️  --gh-pr-comment set but could not post (missing GITHUB_TOKEN / PR context?)");

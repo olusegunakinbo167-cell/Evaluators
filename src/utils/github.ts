@@ -298,3 +298,170 @@ export function buildPrCommentBody(
   lines.push(`<sub>Generated at ${result.timestamp} — <a href="https://github.com/olusegunakinbo167-cell/Evaluators">ai-code-evaluator</a></sub>`);
   return lines.join("\n");
 }
+// Append to src/utils/github.ts after buildPrCommentBody
+
+/**
+ * Build a PR comment body from a MultiSuiteResult.
+ * Includes variance, calibration, cost, and robustness summaries with
+ * pass/fail badges and collapsible details for undetected mutations.
+ */
+export function buildMultiSuitePrCommentBody(
+  result: import("../components/suiteRunner").MultiSuiteResult,
+  options: {
+    markdown?: string;
+    includeMutations?: boolean;
+  } = {}
+): string {
+  const { totalPassed, totalFailed, totalRuns } = result;
+  const failed = totalFailed > 0;
+  const statusEmoji = failed ? "❌" : "✅";
+
+  const lines: string[] = [];
+  lines.push(`## ${statusEmoji} AI Code Evaluator — ${totalPassed}/${totalRuns} passed`);
+  lines.push("");
+
+  const badges: string[] = [];
+  badges.push(failed ? "❌ **FAILED**" : "✅ **PASSED**");
+
+  if (result.tokenStats) {
+    const ts = result.tokenStats;
+    badges.push(`💰 $${ts.totalCostUsd.toFixed(4)}`);
+    badges.push(`🔤 ${ts.totalTokens.toLocaleString()} tokens`);
+    if (ts.cacheHits + ts.cacheMisses > 0) {
+      const hitRate = ((ts.cacheHits / (ts.cacheHits + ts.cacheMisses)) * 100).toFixed(0);
+      badges.push(`⚡ ${hitRate}% cache`);
+    }
+  }
+
+  const allRuns = result.aggregates.flatMap(a => a.runs);
+  const varianceRuns = allRuns.filter(r => r.result.varianceReport);
+  if (varianceRuns.length > 0) {
+    const maxStddev = Math.max(...varianceRuns.map(r => r.result.varianceReport!.maxStddev));
+    const meanStddev = varianceRuns.reduce((s, r) => s + r.result.varianceReport!.meanStddev, 0) / varianceRuns.length;
+    const varIcon = maxStddev > 1.0 ? "⚠️" : "📊";
+    badges.push(`${varIcon} σ max=${maxStddev.toFixed(3)} mean=${meanStddev.toFixed(3)}`);
+  }
+
+  const calRuns = allRuns.filter(r => r.result.calibrationReport && r.result.calibrationReport.n > 0);
+  if (calRuns.length > 0) {
+    const correlations = calRuns.map(r => r.result.calibrationReport!.pearsonR).filter(Number.isFinite);
+    const meanR = correlations.length > 0 ? correlations.reduce((a, b) => a + b, 0) / correlations.length : NaN;
+    const minR = correlations.length > 0 ? Math.min(...correlations) : NaN;
+    const calIcon = Number.isFinite(minR) && minR >= 0.75 ? "🎯" : "⚠️";
+    const rStr = Number.isFinite(meanR) ? meanR.toFixed(3) : "N/A";
+    badges.push(`${calIcon} r=${rStr}`);
+  }
+
+  const robRuns = allRuns.filter(r => r.result.robustnessReport);
+  if (robRuns.length > 0) {
+    const scores = robRuns.map(r => r.result.robustnessReport!.robustnessScore);
+    const meanScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const minScore = Math.min(...scores);
+    const detectionRates = robRuns.map(r => r.result.robustnessReport!.detectionRate);
+    const meanDetection = detectionRates.reduce((a, b) => a + b, 0) / detectionRates.length;
+    const robIcon = minScore >= 6.0 ? "🛡️" : "⚠️";
+    badges.push(`${robIcon} robustness ${meanScore.toFixed(1)}/10 (${(meanDetection * 100).toFixed(0)}% detected)`);
+  }
+
+  lines.push(badges.join(" · "));
+  lines.push("");
+
+  lines.push("| Suite | Passed | Failed | Total | Status |");
+  lines.push("|-------|--------|--------|-------|--------|");
+  for (const agg of result.aggregates) {
+    const icon = agg.failed > 0 ? "❌" : "✅";
+    lines.push(`| ${agg.suiteName} | ${agg.passed} | ${agg.failed} | ${agg.total} | ${icon} |`);
+  }
+  lines.push("");
+
+  if (calRuns.length > 0) {
+    lines.push("<details><summary>🎯 Judge Calibration</summary>");
+    lines.push("");
+    lines.push("| Task | Correlation r | MAE | Agreement | N | Status |");
+    lines.push("|------|----------------|-----|-----------|---|--------|");
+    for (const run of calRuns) {
+      const cr = run.result.calibrationReport!;
+      const failed = run.calibrationViolations.length > 0;
+      const icon = failed ? "❌" : "✅";
+      const rStr = Number.isFinite(cr.pearsonR) ? cr.pearsonR.toFixed(3) : "N/A";
+      lines.push(`| ${run.result.taskId} | ${rStr} | ${cr.mae.toFixed(2)} | ${cr.agreementPct.toFixed(1)}% | ${cr.n} | ${icon} |`);
+    }
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  if (robRuns.length > 0) {
+    lines.push("<details><summary>🛡️ Judge Robustness (Mutation Testing)</summary>");
+    lines.push("");
+    lines.push("| Task | Score | Detection | Mutations | Status |");
+    lines.push("|------|-------|-----------|-----------|--------|");
+    for (const run of robRuns) {
+      const rr = run.result.robustnessReport!;
+      const failed = run.robustnessViolations.length > 0;
+      const icon = failed ? "❌" : "✅";
+      lines.push(
+        `| ${run.result.taskId} | ${rr.robustnessScore.toFixed(1)}/10 | ${(rr.detectionRate * 100).toFixed(0)}% | ${rr.detectedMutations}/${rr.totalMutations} | ${icon} |`
+      );
+    }
+    lines.push("");
+
+    const allUndetected = robRuns.flatMap(run =>
+      (run.result.robustnessReport?.undetected ?? []).map(u => ({ ...u, taskId: run.result.taskId }))
+    );
+
+    if (allUndetected.length > 0 && options.includeMutations !== false) {
+      lines.push("<details><summary>⚠️ Undetected Mutations (click to expand)</summary>");
+      lines.push("");
+      lines.push("| Task | Mutation | Kind | Orig | Mut | Drop |");
+      lines.push("|------|----------|------|------|-----|------|");
+      const sorted = allUndetected.sort((a, b) => a.scoreDrop - b.scoreDrop).slice(0, 20);
+      for (const u of sorted) {
+        lines.push(
+          `| ${u.taskId} | ${u.mutationId} | ${u.kind} | ${u.originalScore} | ${u.mutatedScore} | ${u.scoreDrop.toFixed(2)} |`
+        );
+      }
+      if (allUndetected.length > sorted.length) {
+        lines.push("");
+        lines.push(`_…and ${allUndetected.length - sorted.length} more — see full CI report_`);
+      }
+      lines.push("");
+      lines.push("</details>");
+      lines.push("");
+    }
+
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  if (varianceRuns.length > 0) {
+    lines.push("<details><summary>📊 Variance Report</summary>");
+    lines.push("");
+    lines.push("| Task | Response | Samples | Mean | σ | Min | Max |");
+    lines.push("|------|----------|---------|------|---|-----|-----|");
+    for (const run of varianceRuns) {
+      const vr = run.result.varianceReport!;
+      for (const resp of vr.responses.slice(0, 10)) {
+        lines.push(
+          `| ${run.result.taskId} | ${resp.responseId} | ${resp.samples} | ${resp.mean} | ${resp.stddev} | ${resp.min} | ${resp.max} |`
+        );
+      }
+    }
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
+
+  if (result.tokenStats) {
+    const ts = result.tokenStats;
+    const totalReqs = ts.cacheHits + ts.cacheMisses;
+    const hitRate = totalReqs > 0 ? ((ts.cacheHits / totalReqs) * 100).toFixed(0) : "0";
+    lines.push(
+      `<sub>💰 Cost: $${ts.totalCostUsd.toFixed(4)} · 🔤 Tokens: ${ts.totalTokens.toLocaleString()} · ⚡ Cache: ${ts.cacheHits}/${totalReqs} (${hitRate}%)</sub>`
+    );
+    lines.push("");
+  }
+
+  lines.push(`<sub>Generated by <a href="https://github.com/olusegunakinbo167-cell/Evaluators">ai-code-evaluator</a> — ${new Date().toISOString()}</sub>`);
+  return lines.join("\n");
+}

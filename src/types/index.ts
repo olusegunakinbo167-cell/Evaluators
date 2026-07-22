@@ -254,6 +254,41 @@ export interface CalibrationReport {
   }>;
 }
 
+/** Mutation strategy category. */
+export type MutationKind =
+  | "security"
+  | "syntax"
+  | "logic"
+  | "performance"
+  | "prompt_drift"
+  | "fluff";
+
+/** Judge robustness report from synthetic mutation testing. */
+export interface RobustnessReport {
+  totalMutations: number;
+  detectedMutations: number;
+  /** Detection rate 0-1. */
+  detectionRate: number;
+  /** Robustness score 0-10. */
+  robustnessScore: number;
+  /** Per-kind breakdown. */
+  byKind: Record<MutationKind, {
+    total: number;
+    detected: number;
+    detectionRate: number;
+  }>;
+  /** Mutations the judge failed to catch. */
+  undetected: Array<{
+    mutationId: string;
+    kind: MutationKind;
+    description: string;
+    responseId: string;
+    originalScore: number;
+    mutatedScore: number;
+    scoreDrop: number;
+  }>;
+}
+
 export interface EvaluationResult {
   taskId: string;
   prompt: string;
@@ -269,6 +304,8 @@ export interface EvaluationResult {
   varianceReport?: VarianceReport;
   /** Judge calibration report against ground-truth (if groundTruth was provided). */
   calibrationReport?: CalibrationReport;
+  /** Judge robustness report from mutation testing (if mutations were enabled). */
+  robustnessReport?: RobustnessReport;
   /** Rubric used for this evaluation (if custom). */
   rubric?: RubricDimension[];
 }
@@ -391,6 +428,12 @@ export interface EvaluatorSuiteConfig {
   groundTruth?: string;
   /** Minimum Pearson correlation r required vs ground truth (default 0.75). */
   minCorrelation?: number;
+  /** Number of synthetic mutations to inject per evaluation (0 = disabled). */
+  mutate?: number;
+  /** Minimum robustness score (0-10) required — failing causes exit code 1. Default 6.0 */
+  minRobustness?: number;
+  /** Mutation kinds to include (default: all). */
+  mutateKinds?: MutationKind[];
 }
 
 export interface EvaluatorConfig {
@@ -410,4 +453,10 @@ export interface EvaluatorConfig {
   groundTruth?: string;
   /** Global minimum Pearson correlation r required vs ground truth (default 0.75). */
   minCorrelation?: number;
+  /** Global number of synthetic mutations per evaluation (0 = disabled). */
+  mutate?: number;
+  /** Global minimum robustness score (0-10). Default 6.0 */
+  minRobustness?: number;
+  /** Global mutation kinds filter. */
+  mutateKinds?: MutationKind[];
 }

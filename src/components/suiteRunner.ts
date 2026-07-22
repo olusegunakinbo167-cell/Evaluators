@@ -13,7 +13,8 @@ import {
   LlmEndpointConfig,
   ResponseVariance,
   VarianceReport,
-  GroundTruthFile
+  GroundTruthFile,
+  MutationKind,
 } from "../types";
 import {
   evaluate,
@@ -46,6 +47,13 @@ export interface CalibrationViolation {
   mae: number;
 }
 
+export interface RobustnessViolation {
+  taskId: string;
+  robustnessScore: number;
+  minRobustness: number;
+  detectionRate: number;
+}
+
 export interface SuiteRunResult {
   suiteName: string;
   inputFile: string;
@@ -54,6 +62,7 @@ export interface SuiteRunResult {
   regressionViolations: RegressionViolation[];
   varianceViolations: VarianceViolation[];
   calibrationViolations: CalibrationViolation[];
+    robustnessViolations: RobustnessViolation[];
   failed: boolean;
   error?: string;
 }
@@ -99,6 +108,9 @@ export interface SuiteRunOptions {
   llm?: LlmEndpointConfig;
   groundTruth?: string | GroundTruthFile;
   minCorrelation?: number;
+  mutate?: number;
+  minRobustness?: number;
+  mutateKinds?: MutationKind[];
 }
 
 function sumTelemetry(results: EvaluationResult[]): EvaluationTelemetry {
@@ -186,13 +198,15 @@ async function runWithVariance(
   input: EvaluationInput,
   samples: number,
   disableCache: boolean,
-  llmConfig?: LlmEndpointConfig
+  llmConfig?: LlmEndpointConfig,
+  mutate?: number,
+  mutateKinds?: MutationKind[]
 ): Promise<{ result: EvaluationResult; allResults: EvaluationResult[] }> {
   if (samples <= 1) {
     const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
     const result = hasScores
       ? evaluate(input)
-      : await evaluateAuto(input, undefined, llmConfig, { disableCache });
+      : await evaluateAuto(input, undefined, llmConfig, { disableCache, mutate, mutateKinds });
     return { result, allResults: [result] };
   }
 
@@ -201,7 +215,7 @@ async function runWithVariance(
     const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
     const r = hasScores
       ? evaluate(input)
-      : await evaluateAuto(input, undefined, llmConfig, { disableCache: true });
+      : await evaluateAuto(input, undefined, llmConfig, { disableCache: true, mutate, mutateKinds });
     allResults.push(r);
   }
 
@@ -267,11 +281,15 @@ async function runSingleInput(
     const samples = Math.max(1, Math.floor(opts.samples ?? 1));
     const disableCache = opts.disableCache ?? samples > 1;
 
-    const { result } = await runWithVariance(input, samples, disableCache, opts.llm);
+    const { result } = await runWithVariance(
+      input, samples, disableCache,
+      opts.llm, opts.mutate, opts.mutateKinds
+    );
 
     let thresholdViolations: ThresholdViolation[] = [];
     let regressionViolations: RegressionViolation[] = [];
     let varianceViolations: VarianceViolation[] = [];
+  let robustnessViolations: RobustnessViolation[] = [];
     let failed = false;
 
     if (opts.minScore !== undefined) {
@@ -295,6 +313,7 @@ async function runSingleInput(
           regressionViolations: [],
           varianceViolations: [],
           calibrationViolations: [],
+          robustnessViolations: [],
           failed: true,
           error: `Baseline load failed: ${msg}`,
         };
@@ -331,7 +350,22 @@ async function runSingleInput(
             failed = true;
           }
         }
-      } catch (e) {
+      
+    // Robustness / mutation check
+    let robustnessViolations: RobustnessViolation[] = [];
+    if (result.robustnessReport) {
+      const minRob = opts.minRobustness ?? 6.0;
+      if (result.robustnessReport.robustnessScore < minRob) {
+        robustnessViolations.push({
+          taskId: result.taskId,
+          robustnessScore: result.robustnessReport.robustnessScore,
+          minRobustness: minRob,
+          detectionRate: result.robustnessReport.detectionRate,
+        });
+        failed = true;
+      }
+    }
+} catch (e) {
         // Ground-truth load failed — don't fail the run, just skip calibration
       }
     }
@@ -344,6 +378,7 @@ async function runSingleInput(
       regressionViolations,
       varianceViolations,
       calibrationViolations,
+      robustnessViolations,
       failed,
     };
   } catch (err: unknown) {
@@ -364,6 +399,7 @@ async function runSingleInput(
       regressionViolations: [],
       varianceViolations: [],
       calibrationViolations: [],
+          robustnessViolations: [],
       failed: true,
       error: msg,
     };
@@ -385,6 +421,9 @@ async function runSuite(
     llm: { ...(suite.llm ?? {}), ...(cliOverrides.llm ?? {}) },
     groundTruth: cliOverrides.groundTruth ?? suite.groundTruth,
     minCorrelation: cliOverrides.minCorrelation ?? suite.minCorrelation ?? 0.75,
+    mutate: cliOverrides.mutate ?? suite.mutate,
+    minRobustness: cliOverrides.minRobustness ?? suite.minRobustness ?? 6.0,
+    mutateKinds: cliOverrides.mutateKinds ?? suite.mutateKinds,
   };
 
   const runs: SuiteRunResult[] = [];
