@@ -1,8 +1,10 @@
 /**
- * CI Reporter — GitHub Actions integration for variance and token/cost reporting.
+ * CI Reporter — GitHub Actions integration for variance, token/cost,
+ * and judge calibration reporting.
  */
 
-import { SuiteRunResult, VarianceViolation, MultiSuiteResult } from "../components/suiteRunner";
+import { SuiteRunResult, VarianceViolation, MultiSuiteResult, CalibrationViolation } from "../components/suiteRunner";
+import { CalibrationReport } from "../types";
 
 /**
  * Emit GitHub Actions ::error:: annotations for high-variance responses.
@@ -33,6 +35,40 @@ export function emitVarianceAnnotationsForResult(result: MultiSuiteResult): numb
       if (run.varianceViolations.length > 0) {
         emitVarianceAnnotations(run.varianceViolations, run.inputFile);
         count += run.varianceViolations.length;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Emit GitHub Actions ::error:: annotations for calibration failures.
+ */
+export function emitCalibrationAnnotations(
+  violations: CalibrationViolation[],
+  inputFile: string
+): void {
+  for (const v of violations) {
+    const safeFile = inputFile.replace(/[\r\n]/g, " ");
+    console.error(
+      `::error file=${safeFile},title=Judge calibration failed::` +
+      `Task ${v.taskId} correlation r=${v.correlation.toFixed(4)} ` +
+      `below threshold ${v.minCorrelation} (MAE=${v.mae.toFixed(2)})`
+    );
+  }
+}
+
+/**
+ * Emit calibration annotations for all failed runs in a MultiSuiteResult.
+ * Returns the number of annotations emitted.
+ */
+export function emitCalibrationAnnotationsForResult(result: MultiSuiteResult): number {
+  let count = 0;
+  for (const agg of result.aggregates) {
+    for (const run of agg.runs) {
+      if (run.calibrationViolations.length > 0) {
+        emitCalibrationAnnotations(run.calibrationViolations, run.inputFile);
+        count += run.calibrationViolations.length;
       }
     }
   }
@@ -110,8 +146,76 @@ export function renderVarianceSummary(runs: SuiteRunResult[]): string {
 }
 
 /**
- * Build a complete CI Markdown summary including token/cost stats
- * and variance information.
+ * Render judge calibration summary as Markdown.
+ * Includes per-task correlation, MAE, agreement %, and score delta table.
+ */
+export function renderCalibrationSummary(runs: SuiteRunResult[]): string {
+  const withCalibration = runs.filter(r => r.result.calibrationReport && r.result.calibrationReport.n > 0);
+  if (withCalibration.length === 0) return "";
+
+  const lines: string[] = [];
+
+  lines.push("## Judge Calibration Report");
+  lines.push("");
+
+  // Summary table per task
+  lines.push("| Task | Correlation r | MAE | Agreement % | N | Status |");
+  lines.push("|------|----------------|-----|-------------|---|--------|");
+
+  for (const run of withCalibration) {
+    const cr = run.result.calibrationReport!;
+    const failed = run.calibrationViolations.length > 0;
+    const icon = failed ? "❌" : "✅";
+    const rStr = Number.isFinite(cr.pearsonR) ? cr.pearsonR.toFixed(4) : "N/A";
+    lines.push(
+      `| ${run.result.taskId} | ${rStr} | ${cr.mae.toFixed(2)} | ` +
+      `${cr.agreementPct.toFixed(1)}% | ${cr.n} | ${icon} |`
+    );
+  }
+  lines.push("");
+
+  // Per-dimension breakdown
+  lines.push("### Per-Dimension Calibration");
+  lines.push("");
+  lines.push("| Task | Dimension | r | MAE | N |");
+  lines.push("|------|-----------|---|-----|---|");
+
+  for (const run of withCalibration) {
+    const cr = run.result.calibrationReport!;
+    for (const [dim, stats] of Object.entries(cr.byDimension)) {
+      const rStr = Number.isFinite(stats.pearsonR) ? stats.pearsonR.toFixed(4) : "N/A";
+      const maeStr = Number.isFinite(stats.mae) ? stats.mae.toFixed(2) : "N/A";
+      lines.push(`| ${run.result.taskId} | ${dim} | ${rStr} | ${maeStr} | ${stats.n} |`);
+    }
+  }
+  lines.push("");
+
+  // Per-task score delta table
+  lines.push("### Score Deltas (Judge − Ground Truth)");
+  lines.push("");
+  lines.push("| Task | Response | Dimension | Judge | GT | Δ |");
+  lines.push("|------|----------|-----------|-------|----|---|");
+
+  for (const run of withCalibration) {
+    const cr = run.result.calibrationReport!;
+    // Sort by abs delta descending, show top 20 per task
+    const sorted = [...cr.deltas].sort((a, b) => b.absDelta - a.absDelta).slice(0, 20);
+    for (const d of sorted) {
+      const deltaStr = d.delta >= 0 ? `+${d.delta.toFixed(1)}` : d.delta.toFixed(1);
+      lines.push(
+        `| ${d.taskId} | ${d.responseId} | ${d.dimension} | ` +
+        `${d.judgeScore} | ${d.groundTruthScore} | ${deltaStr} |`
+      );
+    }
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/**
+ * Build a complete CI Markdown summary including token/cost stats,
+ * variance information, and calibration results.
  */
 export function buildCiSummaryMarkdown(result: MultiSuiteResult): string {
   const parts: string[] = [];
@@ -119,6 +223,10 @@ export function buildCiSummaryMarkdown(result: MultiSuiteResult): string {
   if (tokenMd) parts.push(tokenMd);
 
   const allRuns = result.aggregates.flatMap(a => a.runs);
+
+  const calibrationMd = renderCalibrationSummary(allRuns);
+  if (calibrationMd) parts.push(calibrationMd);
+
   const varianceMd = renderVarianceSummary(allRuns);
   if (varianceMd) parts.push(varianceMd);
 

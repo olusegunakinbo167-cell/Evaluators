@@ -234,6 +234,15 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
     // Merge global LLM config with suite-level override
     const llm = mergeLlmConfig(config.llm, suite.llm);
 
+    // Resolve ground-truth path (suite overrides global)
+    const groundTruth = suite.groundTruth
+      ? path.resolve(configDir, suite.groundTruth)
+      : config.groundTruth
+        ? path.resolve(configDir, config.groundTruth)
+        : undefined;
+
+    const minCorrelation = suite.minCorrelation ?? config.minCorrelation;
+
     suites.push({
       name: suite.name,
       inputFiles,
@@ -245,6 +254,8 @@ export function loadEvaluatorConfig(configPath?: string): ResolvedEvaluatorConfi
       samples: suite.samples,
       maxVariance: suite.maxVariance,
       llm,
+      groundTruth,
+      minCorrelation,
     });
   }
 
@@ -271,6 +282,8 @@ export function applyCliOverrides(
     samples?: number;
     maxVariance?: number;
     llm?: LlmEndpointConfig;
+    groundTruth?: string;
+    minCorrelation?: number;
   }
 ): ResolvedSuiteConfig {
   return {
@@ -281,5 +294,7 @@ export function applyCliOverrides(
     samples: overrides.samples ?? suite.samples,
     maxVariance: overrides.maxVariance ?? suite.maxVariance,
     llm: mergeLlmConfig(suite.llm, overrides.llm),
+    groundTruth: overrides.groundTruth ?? suite.groundTruth,
+    minCorrelation: overrides.minCorrelation ?? suite.minCorrelation,
   };
 }

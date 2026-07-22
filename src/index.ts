@@ -14,7 +14,7 @@ import {
   type ThresholdViolation,
   type RegressionViolation,
 } from "./components/evaluator";
-import { checkVariance, type VarianceViolation } from "./components/suiteRunner";
+import { checkVariance, type VarianceViolation, type CalibrationViolation } from "./components/suiteRunner";
 import { exportResult, exportToJSON, exportToCSV, exportToMarkdown, writeGitHubStepSummary } from "./utils/exporter";
 import {
   isGitHubActions,
@@ -27,7 +27,14 @@ import {
 import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
 import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
 import { EvaluationInput, Confidence, EvaluationResult, LlmEndpointConfig } from "./types";
-import { emitVarianceAnnotations, emitVarianceAnnotationsForResult, buildCiSummaryMarkdown } from "./utils/ciReporter";
+import { emitVarianceAnnotations, emitVarianceAnnotationsForResult, emitCalibrationAnnotations, buildCiSummaryMarkdown } from "./utils/ciReporter";
+import {
+  calibrateJudge,
+  loadGroundTruth,
+  checkQualityGate,
+  emitQualityGateAnnotations,
+  formatQualityGateFailures,
+} from "./utils/qualityGate";
 import { MockJudgeProvider } from "./components/llm/mockProvider";
 import { getCacheStats } from "./components/llm/judge";
 
@@ -218,13 +225,15 @@ async function runDemo() {
 async function runSingleEval(
   inputPath: string,
   args: string[]
-): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[]; varianceViolations: VarianceViolation[] }> {
+): Promise<{ result: EvaluationResult; failed: boolean; thresholdViolations: ThresholdViolation[]; regressionViolations: RegressionViolation[]; varianceViolations: VarianceViolation[]; calibrationViolations: CalibrationViolation[] }> {
   const raw = fs.readFileSync(inputPath, "utf-8");
   const input: EvaluationInput = JSON.parse(raw);
 
   const samples = Math.max(1, getArgInt(args, "--samples") ?? 1);
   const maxVariance = getArgFloat(args, "--max-variance");
   const llmConfig = parseLlmCliArgs(args);
+  const groundTruthPath = getArg(args, "--ground-truth");
+  const minCorrelation = getArgFloat(args, "--min-correlation") ?? 0.75;
 
   const hasScores = input.manualScores && Object.keys(input.manualScores).length > 0;
 
@@ -291,6 +300,7 @@ async function runSingleEval(
   let thresholdViolations: ThresholdViolation[] = [];
   let regressionViolations: RegressionViolation[] = [];
   let varianceViolations: VarianceViolation[] = [];
+  let calibrationViolations: CalibrationViolation[] = [];
 
   const minScore = getArgFloat(args, "--min-score");
   if (minScore !== undefined) {
@@ -340,7 +350,41 @@ async function runSingleEval(
     }
   }
 
-  return { result, failed, thresholdViolations, regressionViolations, varianceViolations };
+  // Calibration / ground-truth check
+  if (groundTruthPath) {
+    try {
+      const gt = loadGroundTruth(groundTruthPath);
+      const calibrationReport = calibrateJudge(result, gt);
+      result.calibrationReport = calibrationReport;
+
+      const gateResult = checkQualityGate(calibrationReport, minCorrelation);
+      if (!gateResult.passed) {
+        failed = true;
+        console.error(formatQualityGateFailures(gateResult));
+        if (isGitHubActions()) {
+          emitQualityGateAnnotations(gateResult, result.taskId);
+        }
+        // Populate calibrationViolations for return value
+        calibrationViolations.push({
+          taskId: result.taskId,
+          correlation: gateResult.correlation,
+          minCorrelation: gateResult.minCorrelation,
+          mae: calibrationReport.mae,
+        });
+      } else if (calibrationReport.n > 0) {
+        console.log(
+          `\n📊 Calibration: r=${calibrationReport.pearsonR.toFixed(4)}, ` +
+          `MAE=${calibrationReport.mae.toFixed(2)}, ` +
+          `agreement=${calibrationReport.agreementPct.toFixed(1)}% (n=${calibrationReport.n})\n`
+        );
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`\n⚠️  Ground-truth load failed: ${msg}\n`);
+    }
+  }
+
+  return { result, failed, thresholdViolations, regressionViolations, varianceViolations, calibrationViolations };
 }
 
 // ─── Config / multi-suite CLI mode ───────────────────────────────────────────
@@ -365,6 +409,8 @@ async function runConfigMode(args: string[]): Promise<boolean> {
     samples: getArgInt(args, "--samples"),
     maxVariance: getArgFloat(args, "--max-variance"),
     llm: parseLlmCliArgs(args),
+    groundTruth: getArg(args, "--ground-truth"),
+    minCorrelation: getArgFloat(args, "--min-correlation"),
   };
 
   // Apply CLI overrides to each suite
@@ -390,9 +436,11 @@ async function runConfigMode(args: string[]): Promise<boolean> {
   const ciExtraMarkdown = buildCiSummaryMarkdown(multiResult);
   const fullMarkdown = ciExtraMarkdown ? aggregatedMarkdown + "\n\n" + ciExtraMarkdown : aggregatedMarkdown;
 
-  // Emit variance annotations in CI
+  // Emit variance + calibration annotations in CI
   if (isGitHubActions()) {
     emitVarianceAnnotationsForResult(multiResult);
+    const { emitCalibrationAnnotationsForResult } = await import("./utils/ciReporter.js");
+    emitCalibrationAnnotationsForResult(multiResult);
   }
 
   // Export unified report
@@ -464,17 +512,17 @@ async function runCli() {
   if (!inputPath) {
     console.error(
       "Usage:\n" +
-      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --eval <input.json> [--export json|csv|md] [--min-score <float>] [--baseline <path> --max-regression <float>] [--samples <n> --max-variance <float>] [--ground-truth <path> --min-correlation <float>] [--gh-pr-comment]\n" +
       "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
       "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]\n" +
-      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--gh-pr-comment]\n" +
+      "  node dist/index.js --config <evaluators.config.json> [--export md] [--min-score <float>] [--max-regression <float>] [--samples <n> --max-variance <float>] [--ground-truth <path> --min-correlation <float>] [--gh-pr-comment]\n" +
       "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
       "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]"
     );
     process.exit(1);
   }
 
-  const { result, failed, thresholdViolations, regressionViolations, varianceViolations } = await runSingleEval(inputPath, args);
+  const { result, failed, thresholdViolations, regressionViolations, varianceViolations, calibrationViolations } = await runSingleEval(inputPath, args);
 
   // GitHub Actions step summary
   if (isGitHubActions()) {

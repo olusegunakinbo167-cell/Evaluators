@@ -13,6 +13,7 @@ import {
   LlmEndpointConfig,
   ResponseVariance,
   VarianceReport,
+  GroundTruthFile
 } from "../types";
 import {
   evaluate,
@@ -23,6 +24,7 @@ import {
   ThresholdViolation,
   RegressionViolation,
 } from "./evaluator";
+import { calibrateJudge, loadGroundTruth } from "../utils/qualityGate";
 
 import { ResolvedSuiteConfig } from "../utils/config";
 
@@ -37,6 +39,13 @@ export interface VarianceViolation {
   maxAllowed: number;
 }
 
+export interface CalibrationViolation {
+  taskId: string;
+  correlation: number;
+  minCorrelation: number;
+  mae: number;
+}
+
 export interface SuiteRunResult {
   suiteName: string;
   inputFile: string;
@@ -44,6 +53,7 @@ export interface SuiteRunResult {
   thresholdViolations: ThresholdViolation[];
   regressionViolations: RegressionViolation[];
   varianceViolations: VarianceViolation[];
+  calibrationViolations: CalibrationViolation[];
   failed: boolean;
   error?: string;
 }
@@ -87,6 +97,8 @@ export interface SuiteRunOptions {
   maxVariance?: number;
   disableCache?: boolean;
   llm?: LlmEndpointConfig;
+  groundTruth?: string | GroundTruthFile;
+  minCorrelation?: number;
 }
 
 function sumTelemetry(results: EvaluationResult[]): EvaluationTelemetry {
@@ -282,6 +294,7 @@ async function runSingleInput(
           thresholdViolations: [],
           regressionViolations: [],
           varianceViolations: [],
+          calibrationViolations: [],
           failed: true,
           error: `Baseline load failed: ${msg}`,
         };
@@ -296,6 +309,33 @@ async function runSingleInput(
       }
     }
 
+    // Calibration / ground-truth check
+    const calibrationViolations: CalibrationViolation[] = [];
+    if (opts.groundTruth) {
+      try {
+        const gt: GroundTruthFile = typeof opts.groundTruth === "string"
+          ? loadGroundTruth(opts.groundTruth)
+          : opts.groundTruth;
+        const calibrationReport = calibrateJudge(result, gt);
+        result.calibrationReport = calibrationReport;
+
+        const minCorr = opts.minCorrelation ?? 0.75;
+        if (calibrationReport.n > 0 && Number.isFinite(calibrationReport.pearsonR)) {
+          if (calibrationReport.pearsonR < minCorr) {
+            calibrationViolations.push({
+              taskId: result.taskId,
+              correlation: calibrationReport.pearsonR,
+              minCorrelation: minCorr,
+              mae: calibrationReport.mae,
+            });
+            failed = true;
+          }
+        }
+      } catch (e) {
+        // Ground-truth load failed — don't fail the run, just skip calibration
+      }
+    }
+
     return {
       suiteName,
       inputFile,
@@ -303,6 +343,7 @@ async function runSingleInput(
       thresholdViolations,
       regressionViolations,
       varianceViolations,
+      calibrationViolations,
       failed,
     };
   } catch (err: unknown) {
@@ -322,6 +363,7 @@ async function runSingleInput(
       thresholdViolations: [],
       regressionViolations: [],
       varianceViolations: [],
+      calibrationViolations: [],
       failed: true,
       error: msg,
     };
@@ -341,6 +383,8 @@ async function runSuite(
     maxVariance: cliOverrides.maxVariance ?? suite.maxVariance,
     disableCache: cliOverrides.disableCache,
     llm: { ...(suite.llm ?? {}), ...(cliOverrides.llm ?? {}) },
+    groundTruth: cliOverrides.groundTruth ?? suite.groundTruth,
+    minCorrelation: cliOverrides.minCorrelation ?? suite.minCorrelation ?? 0.75,
   };
 
   const runs: SuiteRunResult[] = [];
@@ -519,6 +563,14 @@ export function buildAggregatedMarkdown(result: MultiSuiteResult): string {
         lines.push("");
       }
 
+      if (run.calibrationViolations.length > 0) {
+        lines.push("**Calibration violations:**");
+        for (const v of run.calibrationViolations) {
+          lines.push(`- Task \`${v.taskId}\`: r=${v.correlation.toFixed(4)} < min ${v.minCorrelation} (MAE=${v.mae.toFixed(2)})`);
+        }
+        lines.push("");
+      }
+
       // Quick score table
       if (run.result.rankings.length > 0) {
         lines.push("| Response | Score | Correctness | Security |");
@@ -543,7 +595,29 @@ export function buildAggregatedMarkdown(result: MultiSuiteResult): string {
     lines.push(`| Total tokens | ${ts.totalTokens.toLocaleString()} |`);
     lines.push(`| Cache hits | ${ts.cacheHits} |`);
     lines.push(`| Cache misses | ${ts.cacheMisses} |`);
-    lines.push(`| Estimated cost | $${ts.totalCostUsd.toFixed(4)} |`);
+    lines.push(`| Estimated cost | ${ts.totalCostUsd.toFixed(4)} |`);
+    lines.push("");
+  }
+
+  // Calibration summary
+  const allRuns = result.aggregates.flatMap(a => a.runs);
+  const calibratedRuns = allRuns.filter(r => r.result.calibrationReport && r.result.calibrationReport.n > 0);
+  if (calibratedRuns.length > 0) {
+    lines.push("---");
+    lines.push("");
+    lines.push("## Judge Calibration Summary");
+    lines.push("");
+    lines.push("| Task | Correlation r | MAE | Agreement % | N | Status |");
+    lines.push("|------|----------------|-----|-------------|---|--------|");
+    for (const run of calibratedRuns) {
+      const cr = run.result.calibrationReport!;
+      const failed = run.calibrationViolations.length > 0;
+      const icon = failed ? "❌" : "✅";
+      const rStr = Number.isFinite(cr.pearsonR) ? cr.pearsonR.toFixed(4) : "N/A";
+      lines.push(
+        `| ${run.result.taskId} | ${rStr} | ${cr.mae.toFixed(2)} | ${cr.agreementPct.toFixed(1)}% | ${cr.n} | ${icon} |`
+      );
+    }
     lines.push("");
   }
 

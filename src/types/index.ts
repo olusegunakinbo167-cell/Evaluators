@@ -202,6 +202,58 @@ export interface VarianceReport {
   highVarianceResponses: string[];
 }
 
+/**
+ * Ground-truth human scores for judge calibration.
+ * Maps task IDs → response IDs → expected rubric scores.
+ */
+export interface GroundTruthEntry {
+  taskId: string;
+  responseId: string;
+  scores: RubricScores;
+  /** Optional human rationale / notes. */
+  notes?: string;
+}
+
+/** Ground-truth file format — array of entries. */
+export type GroundTruthFile = GroundTruthEntry[];
+
+/**
+ * Per-response calibration delta — judge score vs ground truth.
+ */
+export interface CalibrationDelta {
+  taskId: string;
+  responseId: string;
+  dimension: RubricDimensionKey;
+  judgeScore: number;
+  groundTruthScore: number;
+  delta: number;
+  absDelta: number;
+}
+
+/**
+ * Judge calibration report against ground-truth human scores.
+ */
+export interface CalibrationReport {
+  /** Pearson correlation coefficient (r) between judge and ground truth scores. Range [-1, 1]. */
+  pearsonR: number;
+  /** Mean Absolute Error across all dimensions. */
+  mae: number;
+  /** Agreement percentage — share of scores within ±tolerance (default 1.0 point). */
+  agreementPct: number;
+  /** Tolerance used for agreement calculation. */
+  agreementTolerance: number;
+  /** Total number of scored dimensions compared. */
+  n: number;
+  /** Per-response / per-dimension deltas. */
+  deltas: CalibrationDelta[];
+  /** Per-dimension breakdown. */
+  byDimension: Record<RubricDimensionKey, {
+    pearsonR: number;
+    mae: number;
+    n: number;
+  }>;
+}
+
 export interface EvaluationResult {
   taskId: string;
   prompt: string;
@@ -215,6 +267,8 @@ export interface EvaluationResult {
   telemetry?: EvaluationTelemetry;
   /** Variance statistics from multi-pass sampling (if enabled). */
   varianceReport?: VarianceReport;
+  /** Judge calibration report against ground-truth (if groundTruth was provided). */
+  calibrationReport?: CalibrationReport;
   /** Rubric used for this evaluation (if custom). */
   rubric?: RubricDimension[];
 }
@@ -333,6 +387,10 @@ export interface EvaluatorSuiteConfig {
   maxVariance?: number;
   /** LLM endpoint configuration override for this suite. */
   llm?: LlmEndpointConfig;
+  /** Path to ground-truth JSON file for judge calibration. */
+  groundTruth?: string;
+  /** Minimum Pearson correlation r required vs ground truth (default 0.75). */
+  minCorrelation?: number;
 }
 
 export interface EvaluatorConfig {
@@ -348,4 +406,8 @@ export interface EvaluatorConfig {
   maxConcurrency?: number;
   /** Global LLM endpoint configuration (suite-level llm config overrides this). */
   llm?: LlmEndpointConfig;
+  /** Global ground-truth JSON path for judge calibration (suite-level overrides). */
+  groundTruth?: string;
+  /** Global minimum Pearson correlation r required vs ground truth (default 0.75). */
+  minCorrelation?: number;
 }
