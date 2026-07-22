@@ -310,6 +310,8 @@ export function buildMultiSuitePrCommentBody(
   options: {
     markdown?: string;
     includeMutations?: boolean;
+    /** Baseline artifact for comparison (renders Baseline vs Current diff table). */
+    baseline?: import("../types").MultiSuiteArtifact;
   } = {}
 ): string {
   const { totalPassed, totalFailed, totalRuns } = result;
@@ -452,12 +454,94 @@ export function buildMultiSuitePrCommentBody(
     lines.push("");
   }
 
+  // --- Baseline vs Current comparison ---
+  if (options.baseline) {
+    lines.push("## 📊 Baseline vs Current");
+    lines.push("");
+
+    // Build baseline lookup: taskId → result
+    const baselineByTask = new Map<string, any>();
+    for (const agg of options.baseline.result.aggregates || []) {
+      for (const run of agg.runs || []) {
+        baselineByTask.set(run.taskId, run.result);
+      }
+    }
+
+    // Collect comparison data
+    const comparisons: Array<{
+      taskId: string;
+      currentScore: number;
+      baselineScore: number;
+      scoreDelta: number;
+      currentR?: number;
+      baselineR?: number;
+      correlationDelta?: number;
+      currentCost: number;
+      baselineCost: number;
+      costDelta: number;
+    }> = [];
+
+    for (const run of allRuns) {
+      const taskId = run.result.taskId;
+      const baseResult = baselineByTask.get(taskId);
+      if (!baseResult) continue;
+
+      const currScore = run.result.rankings[0]?.weightedScore ?? 0;
+      const baseScore = baseResult.rankings?.[0]?.weightedScore ?? 0;
+      const currR = run.result.calibrationReport?.pearsonR;
+      const baseR = baseResult.calibrationReport?.pearsonR;
+      const currCost = run.result.telemetry?.estimatedCostUsd ?? 0;
+      const baseCost = baseResult.telemetry?.estimatedCostUsd ?? 0;
+
+      comparisons.push({
+        taskId,
+        currentScore: currScore,
+        baselineScore: baseScore,
+        scoreDelta: currScore - baseScore,
+        currentR: currR,
+        baselineR: baseR,
+        correlationDelta: (currR !== undefined && baseR !== undefined) ? currR - baseR : undefined,
+        currentCost: currCost,
+        baselineCost: baseCost,
+        costDelta: currCost - baseCost,
+      });
+    }
+
+    if (comparisons.length > 0) {
+      lines.push("| Task | Score Δ | Correlation Δ | Cost Δ | Status |");
+      lines.push("|------|---------|---------------|--------|--------|");
+      for (const c of comparisons) {
+        const scoreIcon = c.scoreDelta < -0.1 ? "🔻" : c.scoreDelta > 0.1 ? "🔺" : "▬";
+        const scoreStr = `${scoreIcon} ${c.scoreDelta >= 0 ? "+" : ""}${c.scoreDelta.toFixed(2)}`;
+        
+        let corrStr = "—";
+        if (c.correlationDelta !== undefined) {
+          const corrIcon = c.correlationDelta < -0.01 ? "🔻" : c.correlationDelta > 0.01 ? "🔺" : "▬";
+          corrStr = `${corrIcon} ${c.correlationDelta >= 0 ? "+" : ""}${c.correlationDelta.toFixed(3)}`;
+        }
+        
+        const costIcon = c.costDelta > 0.0001 ? "💸" : c.costDelta < -0.0001 ? "💚" : "▬";
+        const costStr = Math.abs(c.costDelta) > 0.00001
+          ? `${costIcon} ${c.costDelta >= 0 ? "+" : ""}${c.costDelta.toFixed(4)}`
+          : "▬ $0.0000";
+        
+        const failed = c.scoreDelta < -0.5 || (c.correlationDelta !== undefined && c.correlationDelta < -0.05);
+        const statusIcon = failed ? "❌" : "✅";
+        
+        lines.push(`| ${c.taskId} | ${scoreStr} | ${corrStr} | ${costStr} | ${statusIcon} |`);
+      }
+      lines.push("");
+      lines.push("<sub>Score Δ = current − baseline (weighted score). Correlation Δ = r_current − r_baseline. Cost Δ in USD.</sub>");
+      lines.push("");
+    }
+  }
+
   if (result.tokenStats) {
     const ts = result.tokenStats;
     const totalReqs = ts.cacheHits + ts.cacheMisses;
     const hitRate = totalReqs > 0 ? ((ts.cacheHits / totalReqs) * 100).toFixed(0) : "0";
     lines.push(
-      `<sub>💰 Cost: $${ts.totalCostUsd.toFixed(4)} · 🔤 Tokens: ${ts.totalTokens.toLocaleString()} · ⚡ Cache: ${ts.cacheHits}/${totalReqs} (${hitRate}%)</sub>`
+      `<sub>💰 Cost: ${ts.totalCostUsd.toFixed(4)} · 🔤 Tokens: ${ts.totalTokens.toLocaleString()} · ⚡ Cache: ${ts.cacheHits}/${totalReqs} (${hitRate}%)</sub>`
     );
     lines.push("");
   }

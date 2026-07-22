@@ -460,3 +460,105 @@ export interface EvaluatorConfig {
   /** Global mutation kinds filter. */
   mutateKinds?: MutationKind[];
 }
+
+/**
+ * Full evaluation artifact — includes result + metadata for CI artifact archiving.
+ * Saved via --save-artifact, loaded via --baseline for regression comparison.
+ */
+export interface EvaluationArtifact {
+  /** Artifact format version. */
+  version: string;
+  /** Timestamp (ISO). */
+  timestamp: string;
+  /** Git commit SHA (if available). */
+  gitSha?: string;
+  /** Evaluation result with full telemetry. */
+  result: EvaluationResult;
+  /** Suite name (if from multi-suite run). */
+  suiteName?: string;
+  /** Input file path. */
+  inputFile?: string;
+  /** CLI flags used. */
+  cliFlags?: Record<string, unknown>;
+}
+
+/**
+ * Multi-suite evaluation artifact.
+ */
+export interface MultiSuiteArtifact {
+  version: string;
+  timestamp: string;
+  gitSha?: string;
+  /** Aggregated multi-suite result. */
+  result: {
+    totalPassed: number;
+    totalFailed: number;
+    totalRuns: number;
+    aggregates: Array<{
+      suiteName: string;
+      passed: number;
+      failed: number;
+      total: number;
+      runs: Array<{
+        inputFile: string;
+        taskId: string;
+        failed: boolean;
+        result: EvaluationResult;
+      }>;
+    }>;
+    tokenStats?: {
+      totalTokens: number;
+      totalCostUsd: number;
+      cacheHits: number;
+      cacheMisses: number;
+    };
+  };
+  cliFlags?: Record<string, unknown>;
+}
+
+/**
+ * Baseline comparison report — current vs baseline artifact.
+ */
+export interface BaselineComparison {
+  /** Per-task score deltas. */
+  scoreDeltas: Array<{
+    taskId: string;
+    responseId: string;
+    currentScore: number;
+    baselineScore: number;
+    delta: number;
+    isRegression: boolean;
+  }>;
+  /** Correlation shift (current r - baseline r). Negative = degradation. */
+  correlationShift?: {
+    currentR: number;
+    baselineR: number;
+    delta: number;
+    isDegradation: boolean;
+  };
+  /** Cost change. */
+  costDelta?: {
+    currentCost: number;
+    baselineCost: number;
+    delta: number;
+    pctChange: number;
+  };
+  /** Token usage change. */
+  tokenDelta?: {
+    currentTokens: number;
+    baselineTokens: number;
+    delta: number;
+    pctChange: number;
+  };
+  /** Robustness score change. */
+  robustnessDelta?: {
+    currentScore: number;
+    baselineScore: number;
+    delta: number;
+    isDegradation: boolean;
+  };
+  /** Overall: any regressions detected? */
+  hasRegressions: boolean;
+  /** Human-readable summary. */
+  summary: string;
+}

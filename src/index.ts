@@ -25,6 +25,12 @@ import {
   buildMultiSuitePrCommentBody,
   appendStepSummary,
 } from "./utils/github";
+import {
+  saveArtifact,
+  saveMultiSuiteArtifact,
+  loadArtifact,
+  compareBaseline,
+} from "./utils/artifact";
 import { loadEvaluatorConfig, applyCliOverrides } from "./utils/config";
 import { runSuites, buildAggregatedMarkdown, type MultiSuiteResult } from "./components/suiteRunner";
 import { EvaluationInput, Confidence, EvaluationResult, LlmEndpointConfig, MutationKind } from "./types";
@@ -249,6 +255,7 @@ async function runSingleEval(
   const minCorrelation = getArgFloat(args, "--min-correlation") ?? 0.75;
   const mutateCount = getArgInt(args, "--mutate") ?? 0;
   const minRobustness = getArgFloat(args, "--min-robustness") ?? 6.0;
+  const saveArtifactPath = getArg(args, "--save-artifact");
   // Parse --mutate-kinds "security,syntax,logic" (comma-separated)
   const mutateKindsArg = getArg(args, "--mutate-kinds");
   const mutateKinds = mutateKindsArg
@@ -336,10 +343,19 @@ async function runSingleEval(
   }
 
   const baselinePath = getArg(args, "--baseline");
+  let baselineCalibration: import("./types").CalibrationReport | undefined;
   if (baselinePath) {
     const maxRegression = getArgFloat(args, "--max-regression") ?? 0;
     try {
-      const baseline = loadBaseline(baselinePath);
+      // Try loading as artifact first, fall back to legacy EvaluationResult
+      let baseline: EvaluationResult;
+      try {
+        const artifact = loadArtifact(baselinePath);
+        baseline = artifact.result;
+        baselineCalibration = baseline.calibrationReport;
+      } catch {
+        baseline = loadBaseline(baselinePath);
+      }
       regressionViolations = checkRegression(result, baseline, maxRegression);
       if (regressionViolations.length > 0) {
         console.error(formatRegressionFailures(regressionViolations));
@@ -378,7 +394,7 @@ async function runSingleEval(
       const calibrationReport = calibrateJudge(result, gt);
       result.calibrationReport = calibrationReport;
 
-      const gateResult = checkQualityGate(calibrationReport, minCorrelation);
+      const gateResult = checkQualityGate(calibrationReport, minCorrelation, baselineCalibration);
       if (!gateResult.passed) {
         failed = true;
         console.error(formatQualityGateFailures(gateResult));
@@ -510,6 +526,21 @@ async function runConfigMode(args: string[]): Promise<boolean> {
   fs.writeFileSync(reportPath, fullMarkdown, "utf-8");
   console.log(`✅ Aggregated report: ${reportPath}\n`);
 
+  // Save multi-suite artifact if requested
+  const saveArtifactPath = getArg(args, "--save-artifact");
+  if (saveArtifactPath) {
+    try {
+      saveMultiSuiteArtifact(multiResult, saveArtifactPath, {
+        config: configPath,
+        suites: config.suites.map(s => s.name),
+      });
+      console.error(`💾 Saved artifact to ${saveArtifactPath}\n`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`⚠️  Failed to save artifact: ${msg}\n`);
+    }
+  }
+
   // GitHub Actions step summary
   if (isGitHubActions()) {
     const wrote = appendStepSummary(fullMarkdown);
@@ -519,7 +550,18 @@ async function runConfigMode(args: string[]): Promise<boolean> {
   // PR comment — aggregate across all suites
   if (hasFlag(args, "--gh-pr-comment")) {
     const prOpts = getPrCommentOptions(args);
-    const prBody = buildMultiSuitePrCommentBody(multiResult, { includeMutations: true });
+    
+    // Load baseline artifact for comparison in PR comment if --baseline is set
+    let baselineArtifact: import("./types").MultiSuiteArtifact | undefined;
+    const baselinePath = getArg(args, "--baseline");
+    if (baselinePath) {
+      try {
+        const { loadMultiSuiteArtifact } = await import("./utils/artifact.js");
+        baselineArtifact = loadMultiSuiteArtifact(baselinePath);
+      } catch { /* ignore, PR comment will render without baseline diff */ }
+    }
+    
+    const prBody = buildMultiSuitePrCommentBody(multiResult, { includeMutations: true, baseline: baselineArtifact });
 
     try {
       const url = await postPrComment(prBody, prOpts);
@@ -565,7 +607,7 @@ async function runCli() {
     console.error(
       "Usage:\n" +
       "  node dist/index.js --eval <input.json> [--export json|csv|md]\n" +
-      "    [--min-score <float>] [--baseline <path> --max-regression <float>]\n" +
+      "    [--min-score <float>] [--baseline <path> --max-regression <float>] [--save-artifact <path>]\n" +
       "    [--samples <n> --max-variance <float>]\n" +
       "    [--ground-truth <path> --min-correlation <float>]\n" +
       "    [--mutate <n> --min-robustness <float> --mutate-kinds <kinds>]\n" +
@@ -573,7 +615,7 @@ async function runCli() {
       "    [--llm-base-url <url>] [--llm-model <name>] [--llm-api-key-env <VAR>] [--llm-api-key <key>]\n" +
       "    [--llm-timeout <ms>] [--llm-temperature <float>] [--llm-retries <n>] [--llm-header \"Key: Value\"]\n" +
       "  node dist/index.js --config <evaluators.config.json> [--export md]\n" +
-      "    [--min-score <float>] [--max-regression <float>]\n" +
+      "    [--min-score <float>] [--baseline <path> --max-regression <float>] [--save-artifact <path>]\n" +
       "    [--samples <n> --max-variance <float>]\n" +
       "    [--ground-truth <path> --min-correlation <float>]\n" +
       "    [--mutate <n> --min-robustness <float> --mutate-kinds <kinds>]\n" +

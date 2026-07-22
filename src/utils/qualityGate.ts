@@ -200,17 +200,26 @@ export interface QualityGateResult {
   correlation: number;
   minCorrelation: number;
   violations: string[];
+  /** Baseline correlation (if baseline check was performed). */
+  baselineCorrelation?: number;
+  /** Correlation delta vs baseline (current - baseline). */
+  correlationDelta?: number;
 }
 
 /**
- * Quality gate check — fails if judge correlation drops below threshold.
+ * Quality gate check — fails if judge correlation drops below threshold,
+ * or degrades vs baseline.
  *
  * @param minCorrelation — minimum Pearson r required (default 0.75)
+ * @param baselineCalibration — optional baseline calibration report for regression check
+ * @param maxCorrelationDrop — maximum allowed correlation drop vs baseline (default 0.05)
  * @returns QualityGateResult with pass/fail and violation messages
  */
 export function checkQualityGate(
   calibrationReport: CalibrationReport | undefined,
-  minCorrelation = DEFAULT_MIN_CORRELATION
+  minCorrelation = DEFAULT_MIN_CORRELATION,
+  baselineCalibration?: CalibrationReport,
+  maxCorrelationDrop = 0.05
 ): QualityGateResult {
   const violations: string[] = [];
 
@@ -225,6 +234,9 @@ export function checkQualityGate(
 
   const r = calibrationReport.pearsonR;
 
+  let baselineCorrelation: number | undefined;
+  let correlationDelta: number | undefined;
+
   if (!Number.isFinite(r)) {
     violations.push(
       `Calibration correlation is not finite (n=${calibrationReport.n}, ` +
@@ -237,11 +249,25 @@ export function checkQualityGate(
     );
   }
 
+  // Baseline correlation regression check
+  if (baselineCalibration && Number.isFinite(baselineCalibration.pearsonR) && Number.isFinite(r)) {
+    baselineCorrelation = baselineCalibration.pearsonR;
+    correlationDelta = r - baselineCorrelation;
+    if (correlationDelta < -maxCorrelationDrop) {
+      violations.push(
+        `Judge correlation degraded vs baseline: ${baselineCorrelation.toFixed(4)} → ${r.toFixed(4)} ` +
+        `(delta ${correlationDelta.toFixed(4)}, allowed ≥ ${-maxCorrelationDrop})`
+      );
+    }
+  }
+
   return {
     passed: violations.length === 0,
     correlation: r,
     minCorrelation,
     violations,
+    baselineCorrelation,
+    correlationDelta,
   };
 }
 
